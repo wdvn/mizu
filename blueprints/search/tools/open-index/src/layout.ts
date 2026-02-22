@@ -1,0 +1,143 @@
+import { css } from './styles'
+
+const chevronSvg = '<svg width="12" height="12" viewBox="0 0 20 20" fill="currentColor"><path fill-rule="evenodd" d="M5.23 7.21a.75.75 0 011.06.02L10 11.168l3.71-3.938a.75.75 0 111.08 1.04l-4.25 4.5a.75.75 0 01-1.08 0l-4.25-4.5a.75.75 0 01.02-1.06z"/></svg>'
+
+const githubSvg = '<svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>'
+
+const nav = [
+  {
+    label: 'Platform',
+    items: [
+      { label: 'Overview', href: '/overview' },
+      { label: 'Architecture', href: '/architecture' },
+      { label: 'Crawler', href: '/crawler' },
+      { label: 'Indexer', href: '/indexer' },
+      { label: 'Knowledge Graph', href: '/knowledge-graph' },
+      { label: 'Vector Search', href: '/vector-search' },
+      { label: 'Ontology', href: '/ontology' },
+      { label: 'Latest Build', href: '/latest-build' },
+    ],
+  },
+  {
+    label: 'Data & APIs',
+    items: [
+      { label: 'Get Started', href: '/get-started' },
+      { label: 'Data Formats', href: '/data-formats' },
+      { label: 'API Reference', href: '/api' },
+      { label: 'Query Language', href: '/query-language' },
+      { label: 'Errata', href: '/errata' },
+    ],
+  },
+  {
+    label: 'Resources',
+    items: [
+      { label: 'Blog', href: '/blog' },
+      { label: 'Documentation', href: '/docs' },
+      { label: 'Research Papers', href: '/research' },
+      { label: 'FAQ', href: '/faq' },
+      { label: 'Status', href: '/status' },
+    ],
+  },
+  {
+    label: 'Community',
+    items: [
+      { label: 'Collaborators', href: '/collaborators' },
+      { label: 'Contributing', href: '/contributing' },
+      { label: 'Discord', href: 'https://discord.gg/openindex' },
+      { label: 'GitHub', href: 'https://github.com/nicholasgasior/gopher-crawl' },
+    ],
+  },
+  {
+    label: 'About',
+    items: [
+      { label: 'Mission', href: '/mission' },
+      { label: 'Impact', href: '/impact' },
+      { label: 'Team', href: '/team' },
+      { label: 'Roadmap', href: '/roadmap' },
+      { label: 'Privacy Policy', href: '/privacy' },
+      { label: 'Terms of Use', href: '/terms' },
+      { label: 'Contact', href: '/contact' },
+    ],
+  },
+]
+
+function renderNav(): string {
+  return nav
+    .map(
+      (group) => `<div class="nav-group">
+        <button class="nav-group-btn">${group.label} ${chevronSvg}</button>
+        <div class="nav-dropdown">
+          ${group.items.map((item) => `<a href="${item.href}">${item.label}</a>`).join('')}
+        </div>
+      </div>`
+    )
+    .join('')
+}
+
+function renderFooter(): string {
+  return `<footer class="footer">
+    <div class="footer-inner">
+      <div class="footer-grid">
+        <div class="footer-brand">
+          <h3>OpenIndex</h3>
+          <p>The open web intelligence platform. Crawl, index, search, and understand the web.</p>
+        </div>
+        ${nav
+          .map(
+            (group) => `<div class="footer-col">
+            <h4>${group.label}</h4>
+            ${group.items.map((item) => `<a href="${item.href}">${item.label}</a>`).join('')}
+          </div>`
+          )
+          .join('')}
+      </div>
+      <div class="footer-bottom">
+        <span>&copy; 2026 OpenIndex Project. Open source under Apache 2.0.</span>
+        <div class="footer-social">
+          <a href="https://github.com/nicholasgasior/gopher-crawl" target="_blank" rel="noopener">GitHub</a>
+          <a href="https://discord.gg/openindex" target="_blank" rel="noopener">Discord</a>
+          <a href="https://x.com/openindex" target="_blank" rel="noopener">X</a>
+        </div>
+      </div>
+    </div>
+  </footer>`
+}
+
+export function layout(title: string, body: string): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title} — OpenIndex</title>
+  <meta name="description" content="OpenIndex: The open web intelligence platform. Crawler, indexer, knowledge graph, ontology, vector search.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>${css}</style>
+</head>
+<body>
+  <header class="header">
+    <div class="header-inner">
+      <a href="/" class="logo">
+        <div class="logo-icon">Oi</div>
+        OpenIndex
+      </a>
+      <nav class="nav">
+        ${renderNav()}
+      </nav>
+      <div class="header-right">
+        <a href="https://github.com/nicholasgasior/gopher-crawl" class="github-link" target="_blank" rel="noopener">
+          ${githubSvg} GitHub
+        </a>
+      </div>
+      <button class="mobile-toggle" aria-label="Menu">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h18M3 6h18M3 18h18"/></svg>
+      </button>
+    </div>
+  </header>
+  ${body}
+  ${renderFooter()}
+</body>
+</html>`
+}

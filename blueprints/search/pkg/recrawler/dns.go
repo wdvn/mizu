@@ -268,7 +268,6 @@ func makeFastDNSClients(timeout time.Duration, connsPerServer int) []*fastdns.Cl
 			Timeout: timeout,
 			Dialer: &fastdns.UDPDialer{
 				Addr:     udpAddr,
-				Timeout:  timeout,
 				MaxConns: uint16(connsPerServer),
 			},
 		}
