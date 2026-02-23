@@ -18,8 +18,9 @@ type Cache struct {
 // CacheData holds all cached Common Crawl data.
 type CacheData struct {
 	// Volatile — expires after TTL
-	Crawls    []Crawl           `json:"crawls,omitempty"`
-	FetchedAt time.Time         `json:"fetched_at"`
+	Crawls        []Crawl   `json:"crawls,omitempty"`
+	LatestCrawlID string    `json:"latest_crawl_id,omitempty"`
+	FetchedAt     time.Time `json:"fetched_at"`
 
 	// Semi-permanent — manifests don't change for a given crawl
 	Manifests map[string][]string `json:"manifests,omitempty"` // key: "CC-MAIN-2026-04:cc-index-table.paths.gz"

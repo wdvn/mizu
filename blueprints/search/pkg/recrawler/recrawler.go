@@ -103,8 +103,11 @@ func New(cfg Config, stats *Stats, rdb *ResultDB) *Recrawler {
 func (r *Recrawler) buildClient(shardID int) *http.Client {
 	cfg := r.config
 
-	dialTimeout := min(cfg.Timeout/2, 2*time.Second)
-	tlsTimeout := min(cfg.Timeout/2, 2*time.Second)
+	// Do not split the user's timeout budget in half for connect/TLS:
+	// with low timeouts (e.g. 1000-1400ms) that creates premature failures
+	// before the overall request timeout is reached.
+	dialTimeout := min(cfg.Timeout, 2*time.Second)
+	tlsTimeout := min(cfg.Timeout, 2*time.Second)
 
 	// Divide idle conns across shards
 	maxIdlePerShard := min(cfg.Workers*2/max(cfg.TransportShards, 1), 100000)
@@ -281,6 +284,32 @@ func (r *Recrawler) HTTPDeadDomains() map[string]bool {
 	result := make(map[string]bool)
 	r.deadDomains.Range(func(key, _ any) bool {
 		result[key.(string)] = true
+		return true
+	})
+	return result
+}
+
+// DeadDomainReasons returns domains marked dead and their reasons.
+func (r *Recrawler) DeadDomainReasons() map[string]string {
+	result := make(map[string]string)
+	r.deadDomains.Range(func(key, value any) bool {
+		domain, _ := key.(string)
+		reason, _ := value.(string)
+		result[domain] = reason
+		return true
+	})
+	return result
+}
+
+// SucceededDomains returns domains that had at least one successful HTTP response.
+func (r *Recrawler) SucceededDomains() map[string]bool {
+	result := make(map[string]bool)
+	r.domainSucceeded.Range(func(key, value any) bool {
+		domain, _ := key.(string)
+		ok, _ := value.(bool)
+		if ok {
+			result[domain] = true
+		}
 		return true
 	})
 	return result
@@ -748,15 +777,40 @@ func (r *Recrawler) fetchOne(ctx context.Context, client *http.Client, seed Seed
 		method = http.MethodHead
 	}
 
-	req, err := http.NewRequestWithContext(ctx, method, seed.URL, nil)
-	if err != nil {
-		r.recordError(seed, 0, start, err)
-		return
+	var (
+		resp *http.Response
+		err  error
+	)
+	clients := []*http.Client{client}
+	if alt := r.alternateClient(client); alt != nil {
+		clients = append(clients, alt)
 	}
-	req.Header.Set("User-Agent", r.config.UserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+	for attempt, c := range clients {
+		req, reqErr := http.NewRequestWithContext(ctx, method, seed.URL, nil)
+		if reqErr != nil {
+			r.recordError(seed, 0, start, reqErr)
+			return
+		}
+		req.Header.Set("User-Agent", r.config.UserAgent)
+		req.Header.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
 
-	resp, err := client.Do(req)
+		resp, err = c.Do(req)
+		if err == nil {
+			break
+		}
+		// One retry for transient network timeouts/handshake/header delays.
+		if attempt == 0 && shouldRetryTransientRequestError(err) {
+			select {
+			case <-ctx.Done():
+				// Stop retrying if the run is shutting down.
+				goto requestDone
+			case <-time.After(25 * time.Millisecond):
+			}
+			continue
+		}
+		break
+	}
+requestDone:
 	if err != nil {
 		isTimeout := isTimeoutError(err)
 		// Mark domain dead on definitive connection failures only.
@@ -888,6 +942,33 @@ func (r *Recrawler) fetchOne(ctx context.Context, client *http.Client, seed Seed
 		FetchTimeMs:   fetchMs,
 		CrawledAt:     time.Now(),
 	})
+}
+
+func (r *Recrawler) alternateClient(current *http.Client) *http.Client {
+	if len(r.clients) < 2 {
+		return nil
+	}
+	for i, c := range r.clients {
+		if c == current {
+			return r.clients[(i+1)%len(r.clients)]
+		}
+	}
+	// Fallback: a different shard than the caller likely used.
+	return r.clients[1]
+}
+
+func shouldRetryTransientRequestError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTimeoutError(err) {
+		return true
+	}
+	// Retry a narrow set of transient transport errors.
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "temporary") ||
+		strings.Contains(s, "server misbehaving") ||
+		strings.Contains(s, "use of closed network connection")
 }
 
 func (r *Recrawler) recordError(seed SeedURL, statusCode int, start time.Time, err error) {

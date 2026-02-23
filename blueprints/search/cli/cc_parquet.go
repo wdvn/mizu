@@ -20,7 +20,7 @@ func newCCParquet() *cobra.Command {
 		Short: "List, download, and import columnar-index parquet files",
 		Long: `Work with Common Crawl columnar-index parquet files directly.
 
-This command can list every parquet file in a crawl dump (all subsets),
+This command can list parquet files in a crawl dump (defaults: latest crawl, subset=warc),
 download specific files or samples, and import them into per-parquet DuckDB
 databases with a catalog DuckDB view.`,
 	}
@@ -47,8 +47,8 @@ func newCCParquetList() *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&crawlID, "crawl", "CC-MAIN-2026-08", "Crawl ID")
-	cmd.Flags().StringVar(&subset, "subset", "", "Subset filter (e.g. warc, crawldiagnostics)")
+	cmd.Flags().StringVar(&crawlID, "crawl", "", "Crawl ID (default: latest cached/latest available)")
+	cmd.Flags().StringVar(&subset, "subset", "warc", "Subset filter (default: warc; use 'all' for every subset)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Max rows to display (0=all)")
 	cmd.Flags().BoolVar(&namesOnly, "names-only", false, "Print only manifest index + remote path")
 
@@ -59,6 +59,21 @@ func runCCParquetList(ctx context.Context, crawlID, subset string, limit int, na
 	fmt.Println(Banner())
 	fmt.Println(subtitleStyle.Render("CC Columnar Parquet Manifest"))
 	fmt.Println()
+
+	resolvedCrawlID, crawlNote, err := ccResolveCrawlID(ctx, crawlID)
+	if err != nil {
+		return fmt.Errorf("resolving crawl: %w", err)
+	}
+	crawlID = resolvedCrawlID
+	subset = ccNormalizeParquetSubset(subset)
+	if crawlNote != "" || subset == "warc" {
+		fmt.Println(labelStyle.Render("Using defaults"))
+		ccPrintDefaultCrawlResolution(crawlID, crawlNote)
+		if subset == "warc" {
+			fmt.Println(labelStyle.Render("  Using subset: warc (default)"))
+		}
+		fmt.Println()
+	}
 
 	cfg := cc.DefaultConfig()
 	cfg.CrawlID = crawlID
@@ -79,12 +94,19 @@ func runCCParquetList(ctx context.Context, crawlID, subset string, limit int, na
 	}
 
 	subsetCounts := make(map[string]int)
+	subsetOrdinals := make([]int, len(files))
+	nextSubsetOrdinal := make(map[string]int)
 	for _, f := range files {
 		key := f.Subset
 		if key == "" {
 			key = "(none)"
 		}
 		subsetCounts[key]++
+	}
+	for i, f := range files {
+		key := f.Subset
+		subsetOrdinals[i] = nextSubsetOrdinal[key]
+		nextSubsetOrdinal[key]++
 	}
 
 	fmt.Println()
@@ -114,20 +136,24 @@ func runCCParquetList(ctx context.Context, crawlID, subset string, limit int, na
 
 	fmt.Println()
 	if namesOnly {
-		for _, f := range display {
-			fmt.Printf("  [%d] %s\n", f.ManifestIndex, f.RemotePath)
+		for i, f := range display {
+			subIdx := subsetOrdinals[i]
+			fmt.Printf("  m:%d  %s:%d  %s\n", f.ManifestIndex, f.Subset, subIdx, f.RemotePath)
 		}
 	} else {
-		fmt.Printf("  %-8s %-18s %-9s %-20s %s\n", "Manifest", "Subset", "Local", "Filename", "Remote Path")
-		fmt.Println(strings.Repeat("─", 140))
-		for _, f := range display {
+		fmt.Printf("  %-10s %-9s %-18s %-9s %-10s %-24s %s\n", "Manifest", "Subset#", "Subset", "Local", "Size", "Filename", "Remote Path")
+		fmt.Println(strings.Repeat("─", 170))
+		for i, f := range display {
+			subIdx := subsetOrdinals[i]
 			localPath := cc.LocalParquetPathForRemote(cfg, f.RemotePath)
 			local := labelStyle.Render("missing")
+			localSize := "-"
 			if st, statErr := os.Stat(localPath); statErr == nil && st.Size() > 0 {
 				local = successStyle.Render("yes")
+				localSize = ccFmtBytes(st.Size())
 			}
-			fmt.Printf("  %-8d %-18s %-9s %-20s %s\n",
-				f.ManifestIndex, f.Subset, local, trimMiddle(f.Filename, 20), f.RemotePath)
+			fmt.Printf("  %-10s %-9d %-18s %-9s %-10s %-24s %s\n",
+				fmt.Sprintf("m:%d", f.ManifestIndex), subIdx, f.Subset, local, localSize, trimMiddle(f.Filename, 24), f.RemotePath)
 		}
 	}
 
@@ -135,6 +161,12 @@ func runCCParquetList(ctx context.Context, crawlID, subset string, limit int, na
 		fmt.Println()
 		fmt.Println(labelStyle.Render(fmt.Sprintf("  Showing %d of %d entries", len(display), len(files))))
 	}
+	fmt.Println()
+	fmt.Println(infoStyle.Render("Selector tips:"))
+	if subset == "" || subset == "warc" {
+		fmt.Println(labelStyle.Render("  recrawl: `--file N` uses warc subset index (Subset# column)"))
+	}
+	fmt.Println(labelStyle.Render("  recrawl/download: `--file m:N` uses manifest index (Manifest column)"))
 	return nil
 }
 
@@ -162,8 +194,8 @@ Modes:
 		},
 	}
 
-	cmd.Flags().StringVar(&crawlID, "crawl", "CC-MAIN-2026-08", "Crawl ID")
-	cmd.Flags().StringVar(&subset, "subset", "", "Subset filter (e.g. warc, crawldiagnostics)")
+	cmd.Flags().StringVar(&crawlID, "crawl", "", "Crawl ID (default: latest cached/latest available)")
+	cmd.Flags().StringVar(&subset, "subset", "warc", "Subset filter (default: warc; use 'all' for every subset)")
 	cmd.Flags().IntVar(&fileIdx, "file", -1, "Manifest index to download (all-subset manifest index)")
 	cmd.Flags().IntVar(&sample, "sample", 0, "Download N evenly spaced files (after subset filter)")
 	cmd.Flags().BoolVar(&all, "all", false, "Download all files (after subset filter)")
@@ -176,6 +208,21 @@ func runCCParquetDownload(ctx context.Context, crawlID, subset string, fileIdx, 
 	fmt.Println(Banner())
 	fmt.Println(subtitleStyle.Render("CC Parquet Download"))
 	fmt.Println()
+
+	resolvedCrawlID, crawlNote, err := ccResolveCrawlID(ctx, crawlID)
+	if err != nil {
+		return fmt.Errorf("resolving crawl: %w", err)
+	}
+	crawlID = resolvedCrawlID
+	subset = ccNormalizeParquetSubset(subset)
+	if crawlNote != "" || subset == "warc" {
+		fmt.Println(labelStyle.Render("Using defaults"))
+		ccPrintDefaultCrawlResolution(crawlID, crawlNote)
+		if subset == "warc" {
+			fmt.Println(labelStyle.Render("  Using subset: warc (default)"))
+		}
+		fmt.Println()
+	}
 
 	cfg := cc.DefaultConfig()
 	cfg.CrawlID = crawlID
@@ -214,6 +261,9 @@ func runCCParquetDownload(ctx context.Context, crawlID, subset string, fileIdx, 
 		ccFmtInt64(int64(len(files))), time.Since(manifestStart).Truncate(time.Millisecond))))
 
 	if len(files) == 0 {
+		if subset == "" {
+			return fmt.Errorf("no parquet files matched (all subsets)")
+		}
 		return fmt.Errorf("no parquet files matched subset=%q", subset)
 	}
 	selected := files
@@ -249,8 +299,8 @@ build a catalog DuckDB at index.duckdb containing metadata tables and a ccindex 
 		},
 	}
 
-	cmd.Flags().StringVar(&crawlID, "crawl", "CC-MAIN-2026-08", "Crawl ID")
-	cmd.Flags().StringVar(&subset, "subset", "", "Subset filter for local parquet files")
+	cmd.Flags().StringVar(&crawlID, "crawl", "", "Crawl ID (default: latest cached/latest available)")
+	cmd.Flags().StringVar(&subset, "subset", "warc", "Subset filter for local parquet files (default: warc; use 'all' for every subset)")
 	cmd.Flags().StringVar(&file, "file", "", "Import a specific local parquet file")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Import only the first N matching local parquet files (0=all)")
 
@@ -262,11 +312,25 @@ func runCCParquetImport(ctx context.Context, crawlID, subset, file string, limit
 	fmt.Println(subtitleStyle.Render("CC Parquet Import"))
 	fmt.Println()
 
+	resolvedCrawlID, crawlNote, err := ccResolveCrawlID(ctx, crawlID)
+	if err != nil {
+		return fmt.Errorf("resolving crawl: %w", err)
+	}
+	crawlID = resolvedCrawlID
+	subset = ccNormalizeParquetSubset(subset)
+	if crawlNote != "" || subset == "warc" {
+		fmt.Println(labelStyle.Render("Using defaults"))
+		ccPrintDefaultCrawlResolution(crawlID, crawlNote)
+		if subset == "warc" {
+			fmt.Println(labelStyle.Render("  Using subset: warc (default)"))
+		}
+		fmt.Println()
+	}
+
 	cfg := cc.DefaultConfig()
 	cfg.CrawlID = crawlID
 
 	var parquetPaths []string
-	var err error
 
 	if file != "" {
 		if _, err := os.Stat(file); err != nil {
