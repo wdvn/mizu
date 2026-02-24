@@ -17,7 +17,7 @@ type CompactOptions struct {
 	ToID             int64
 	ChunkIDSpan      int64
 	CompressionLevel int
-	PruneAPI         bool
+	PruneDelta       bool
 }
 
 type CompactChunkResult struct {
@@ -32,12 +32,12 @@ type CompactResult struct {
 	ChunkIDSpan     int64
 	FromID          int64
 	ToID            int64
-	APIRows         int64
+	DeltaRows       int64
 	ChunksTouched   int
 	ChunksWritten   int
 	ChunksSkipped   int
 	FilesPruned     int
-	APIChunksPruned int
+	DeltaFilesPruned int
 	Elapsed         time.Duration
 	Chunks          []CompactChunkResult
 }
@@ -48,11 +48,11 @@ func (c Config) CompactDeltaToClickHouseParquet(ctx context.Context, opts Compac
 		return nil, fmt.Errorf("prepare directories: %w", err)
 	}
 
-	apiChunks, err := listLocalAPIChunks(cfg.APIChunksDir())
+	deltaChunks, err := listLocalCHChunks(cfg.ClickHouseDeltaParquetDir())
 	if err != nil {
-		return nil, fmt.Errorf("list api chunks: %w", err)
+		return nil, fmt.Errorf("list clickhouse delta chunks: %w", err)
 	}
-	if len(apiChunks) == 0 {
+	if len(deltaChunks) == 0 {
 		return &CompactResult{Dir: cfg.ClickHouseParquetDir()}, nil
 	}
 
@@ -72,25 +72,25 @@ func (c Config) CompactDeltaToClickHouseParquet(ctx context.Context, opts Compac
 
 	fromID, toID := opts.FromID, opts.ToID
 	if fromID <= 0 || toID <= 0 {
-		if st, err := cfg.ReadDownloadState(); err == nil && st != nil && st.API != nil {
+		if st, err := cfg.ReadDownloadState(); err == nil && st != nil && st.Delta != nil {
 			if fromID <= 0 {
-				fromID = st.API.StartID
+				fromID = st.Delta.StartID
 			}
 			if toID <= 0 {
-				toID = st.API.EndID
+				toID = st.Delta.EndID
 			}
 		}
 	}
 	if fromID <= 0 {
-		fromID = apiChunks[0].StartID
+		fromID = deltaChunks[0].StartID
 	}
 	if toID <= 0 {
-		toID = apiChunks[len(apiChunks)-1].EndID
+		toID = deltaChunks[len(deltaChunks)-1].EndID
 	}
 	if toID < fromID {
-		// Most recent delta run may be a no-op and store start>end. Fall back to local API chunk files.
-		fromID = apiChunks[0].StartID
-		toID = apiChunks[len(apiChunks)-1].EndID
+		// Most recent delta run may be a no-op and store start>end. Fall back to local delta chunk files.
+		fromID = deltaChunks[0].StartID
+		toID = deltaChunks[len(deltaChunks)-1].EndID
 	}
 	if toID < fromID {
 		return nil, fmt.Errorf("invalid compact range: from=%d to=%d", fromID, toID)
@@ -112,32 +112,48 @@ func (c Config) CompactDeltaToClickHouseParquet(ctx context.Context, opts Compac
 	_, _ = db.ExecContext(ctx, `SET preserve_insertion_order=false`)
 	_, _ = db.ExecContext(ctx, `SET threads=4`)
 
-	apiPattern := filepath.Join(cfg.APIChunksDir(), "*.jsonl")
-	apiDeltaRawSQL := buildAPIRawClickHouseLikeSelect(apiPattern)
-	apiDeltaRawSQL = fmt.Sprintf(`SELECT * FROM (%s) AS __api_raw WHERE id BETWEEN %d AND %d`, apiDeltaRawSQL, fromID, toID)
-	if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_api_delta_raw AS `+apiDeltaRawSQL); err != nil {
-		return nil, fmt.Errorf("create api delta raw temp table: %w", err)
+	deltaPattern := filepath.Join(cfg.ClickHouseDeltaParquetDir(), "*.parquet")
+	deltaRawSQL := fmt.Sprintf(`SELECT
+  try_cast(id AS BIGINT) AS id,
+  try_cast(deleted AS BIGINT) AS deleted,
+  try_cast(type AS BIGINT) AS type,
+  CAST("by" AS VARCHAR) AS "by",
+  try_cast(time AS BIGINT) AS time,
+  CAST(text AS VARCHAR) AS text,
+  try_cast(dead AS BIGINT) AS dead,
+  try_cast(parent AS BIGINT) AS parent,
+  try_cast(poll AS BIGINT) AS poll,
+  try_cast(kids AS BIGINT[]) AS kids,
+  CAST(url AS VARCHAR) AS url,
+  try_cast(score AS BIGINT) AS score,
+  CAST(title AS VARCHAR) AS title,
+  try_cast(parts AS BIGINT[]) AS parts,
+  try_cast(descendants AS BIGINT) AS descendants
+FROM read_parquet('%s')
+WHERE try_cast(id AS BIGINT) BETWEEN %d AND %d`, escapeSQLString(deltaPattern), fromID, toID)
+	if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_delta_raw AS `+deltaRawSQL); err != nil {
+		return nil, fmt.Errorf("create clickhouse delta raw temp table: %w", err)
 	}
-	defer func() { _, _ = db.ExecContext(context.Background(), `DROP TABLE IF EXISTS hn_api_delta_raw`) }()
+	defer func() { _, _ = db.ExecContext(context.Background(), `DROP TABLE IF EXISTS hn_delta_raw`) }()
 
-	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM hn_api_delta_raw`).Scan(&res.APIRows); err != nil {
-		return nil, fmt.Errorf("count api delta rows: %w", err)
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM hn_delta_raw`).Scan(&res.DeltaRows); err != nil {
+		return nil, fmt.Errorf("count clickhouse delta rows: %w", err)
 	}
-	if res.APIRows == 0 {
+	if res.DeltaRows == 0 {
 		res.Elapsed = time.Since(started)
 		return res, nil
 	}
 
 	type touchedChunk struct {
 		ChunkStart int64
-		APIMaxID   int64
-		APIRows    int64
+		DeltaMaxID int64
+		DeltaRows  int64
 	}
 	var touched []touchedChunk
 	rows, err := db.QueryContext(ctx, fmt.Sprintf(`SELECT (((id - 1) // %d) * %d) + 1 AS chunk_start, MAX(id) AS api_max_id, COUNT(*) AS n
-FROM hn_api_delta_raw
-GROUP BY 1
-ORDER BY 1`, span, span))
+	FROM hn_delta_raw
+	GROUP BY 1
+	ORDER BY 1`, span, span))
 	if err != nil {
 		return nil, fmt.Errorf("list touched chunks: %w", err)
 	}
@@ -178,21 +194,21 @@ ORDER BY 1`, span, span))
 		if existingEnd > 0 && existingEnd < targetEnd {
 			targetEnd = existingEnd
 		}
-		if tc.APIMaxID > targetEnd && tc.APIMaxID < nominalEnd {
-			targetEnd = tc.APIMaxID
-		}
-		if existingEnd == 0 && tc.APIMaxID < targetEnd {
-			targetEnd = tc.APIMaxID
-		}
+			if tc.DeltaMaxID > targetEnd && tc.DeltaMaxID < nominalEnd {
+				targetEnd = tc.DeltaMaxID
+			}
+			if existingEnd == 0 && tc.DeltaMaxID < targetEnd {
+				targetEnd = tc.DeltaMaxID
+			}
 
-		var apiRowsInChunk int64
-		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM hn_api_delta_raw WHERE id BETWEEN ? AND ?`, tc.ChunkStart, targetEnd).Scan(&apiRowsInChunk); err != nil {
-			return nil, fmt.Errorf("count api rows in chunk %d-%d: %w", tc.ChunkStart, targetEnd, err)
-		}
-		if apiRowsInChunk == 0 {
-			res.ChunksSkipped++
-			continue
-		}
+			var deltaRowsInChunk int64
+			if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM hn_delta_raw WHERE id BETWEEN ? AND ?`, tc.ChunkStart, targetEnd).Scan(&deltaRowsInChunk); err != nil {
+				return nil, fmt.Errorf("count delta rows in chunk %d-%d: %w", tc.ChunkStart, targetEnd, err)
+			}
+			if deltaRowsInChunk == 0 {
+				res.ChunksSkipped++
+				continue
+			}
 
 		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS hn_chunk_base_raw`)
 		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS hn_chunk_merged_raw`)
@@ -223,7 +239,7 @@ WHERE try_cast(id AS BIGINT) BETWEEN %d AND %d`, escapeSQLString(glob), tc.Chunk
 				return nil, fmt.Errorf("load base raw chunk %d: %w", tc.ChunkStart, err)
 			}
 		} else {
-			if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_chunk_base_raw AS SELECT * FROM hn_api_delta_raw WHERE 1=0`); err != nil {
+				if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_chunk_base_raw AS SELECT * FROM hn_delta_raw WHERE 1=0`); err != nil {
 				return nil, fmt.Errorf("create empty base raw chunk table: %w", err)
 			}
 		}
@@ -242,8 +258,8 @@ SELECT * EXCLUDE (__rn, source_priority) FROM (
     SELECT
       id, deleted, type, "by", time, text, dead, parent, poll, kids, url, score, title, parts, descendants,
       0 AS source_priority
-    FROM hn_api_delta_raw
-    WHERE id BETWEEN %d AND %d
+	    FROM hn_delta_raw
+	    WHERE id BETWEEN %d AND %d
   ) AS __raw_union
 ) AS __raw_ranked
 WHERE __rn = 1`, tc.ChunkStart, targetEnd, tc.ChunkStart, targetEnd)
@@ -289,11 +305,11 @@ WHERE __rn = 1`, tc.ChunkStart, targetEnd, tc.ChunkStart, targetEnd)
 		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS hn_chunk_merged_raw`)
 	}
 
-	if opts.PruneAPI {
-		for _, cf := range apiChunks {
+	if opts.PruneDelta {
+		for _, cf := range deltaChunks {
 			if cf.StartID >= fromID && cf.EndID <= toID {
 				if err := os.Remove(cf.Path); err == nil || os.IsNotExist(err) {
-					res.APIChunksPruned++
+					res.DeltaFilesPruned++
 				}
 			}
 		}
@@ -301,58 +317,4 @@ WHERE __rn = 1`, tc.ChunkStart, targetEnd, tc.ChunkStart, targetEnd)
 
 	res.Elapsed = time.Since(started)
 	return res, nil
-}
-
-func buildAPIRawClickHouseLikeSelect(apiJSONLPattern string) string {
-	escaped := escapeSQLString(apiJSONLPattern)
-	return fmt.Sprintf(`WITH __hn_api_tmp AS (
-  SELECT * FROM read_json_auto(
-    '%s',
-    format='newline_delimited',
-    union_by_name=true,
-    ignore_errors=true,
-    columns={
-      id:'BIGINT',
-      deleted:'BOOLEAN',
-      type:'VARCHAR',
-      "by":'VARCHAR',
-      time:'BIGINT',
-      text:'VARCHAR',
-      dead:'BOOLEAN',
-      parent:'BIGINT',
-      poll:'BIGINT',
-      kids:'BIGINT[]',
-      url:'VARCHAR',
-      score:'BIGINT',
-      title:'VARCHAR',
-      parts:'BIGINT[]',
-      descendants:'BIGINT'
-    }
-  )
-)
-SELECT
-  try_cast(src.id AS BIGINT) AS id,
-  COALESCE(CASE WHEN src.deleted THEN 1 ELSE 0 END, 0) AS deleted,
-  CASE lower(trim(CAST(src.type AS VARCHAR)))
-    WHEN 'story' THEN 1
-    WHEN 'comment' THEN 2
-    WHEN 'poll' THEN 3
-    WHEN 'pollopt' THEN 4
-    WHEN 'job' THEN 5
-    ELSE try_cast(src.type AS BIGINT)
-  END AS type,
-  CAST(src."by" AS VARCHAR) AS "by",
-  try_cast(src.time AS BIGINT) AS time,
-  CAST(src.text AS VARCHAR) AS text,
-  COALESCE(CASE WHEN src.dead THEN 1 ELSE 0 END, 0) AS dead,
-  try_cast(src.parent AS BIGINT) AS parent,
-  try_cast(src.poll AS BIGINT) AS poll,
-  try_cast(src.kids AS BIGINT[]) AS kids,
-  CAST(src.url AS VARCHAR) AS url,
-  try_cast(src.score AS BIGINT) AS score,
-  CAST(src.title AS VARCHAR) AS title,
-  try_cast(src.parts AS BIGINT[]) AS parts,
-  try_cast(src.descendants AS BIGINT) AS descendants
-FROM __hn_api_tmp AS src
-WHERE try_cast(src.id AS BIGINT) IS NOT NULL`, escaped)
 }

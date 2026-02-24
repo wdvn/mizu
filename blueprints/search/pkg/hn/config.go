@@ -130,6 +130,10 @@ func (c Config) ClickHouseParquetDir() string {
 	return filepath.Join(c.RawDir(), "clickhouse")
 }
 
+func (c Config) ClickHouseDeltaParquetDir() string {
+	return filepath.Join(c.RawDir(), "clickhouse_delta")
+}
+
 func (c Config) APIDir() string {
 	return filepath.Join(c.RawDir(), "api")
 }
@@ -170,6 +174,9 @@ func (c Config) EnsureRawDirs() error {
 		return err
 	}
 	if err := c.ensureDir(c.ClickHouseParquetDir()); err != nil {
+		return err
+	}
+	if err := c.ensureDir(c.ClickHouseDeltaParquetDir()); err != nil {
 		return err
 	}
 	return c.ensureDir(c.StateDir())

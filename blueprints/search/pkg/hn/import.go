@@ -179,18 +179,24 @@ func (c Config) resolveLocalImportSource(requested ImportSource) (ImportSource, 
 	chParquetPattern := filepath.Join(cfg.ClickHouseParquetDir(), "*.parquet")
 	chParquetFiles, _ := sortedGlob(chParquetPattern)
 	hasClickHouseParquet := len(chParquetFiles) > 0
+	deltaPattern := filepath.Join(cfg.ClickHouseDeltaParquetDir(), "*.parquet")
+	deltaChunks, _ := sortedGlob(deltaPattern)
+	hasDelta := len(deltaChunks) > 0
 	apiPattern := filepath.Join(cfg.APIChunksDir(), "*.jsonl")
 	apiChunks, _ := sortedGlob(apiPattern)
-	hasAPI := len(apiChunks) > 0
+	hasAPI := len(apiChunks) > 0 // legacy fallback, not used by new HN CLI
 
 	switch requested {
 	case ImportSourceAuto:
-		if hasClickHouseParquet && hasAPI {
-			return ImportSourceHybrid, chParquetPattern + " + " + apiPattern, nil
-		}
-		if hasClickHouseParquet {
-			return ImportSourceClickHouse, chParquetPattern, nil
-		}
+			if hasClickHouseParquet && hasDelta {
+				return ImportSourceHybrid, chParquetPattern + " + " + deltaPattern, nil
+			}
+			if hasClickHouseParquet {
+				return ImportSourceClickHouse, chParquetPattern, nil
+			}
+			if hasDelta {
+				return ImportSourceClickHouse, deltaPattern, nil
+			}
 		if hasParquet {
 			return ImportSourceParquet, cfg.RawParquetPath(), nil
 		}
@@ -212,10 +218,10 @@ func (c Config) resolveLocalImportSource(requested ImportSource) (ImportSource, 
 		if !hasClickHouseParquet {
 			return "", "", fmt.Errorf("hybrid import requires clickhouse parquet chunks: %s", chParquetPattern)
 		}
-		if !hasAPI {
-			return "", "", fmt.Errorf("hybrid import requires API chunk files: %s", apiPattern)
-		}
-		return ImportSourceHybrid, chParquetPattern + " + " + apiPattern, nil
+			if !hasDelta {
+				return "", "", fmt.Errorf("hybrid import requires clickhouse delta parquet chunks: %s", deltaPattern)
+			}
+			return ImportSourceHybrid, chParquetPattern + " + " + deltaPattern, nil
 	case ImportSourceAPI:
 		if !hasAPI {
 			return "", "", fmt.Errorf("no API chunk files found: %s", apiPattern)
@@ -312,9 +318,9 @@ func (c Config) suggestIncrementalImportFromID(ctx context.Context, db *sql.DB, 
 	}
 
 	fromAPITail := int64(0)
-	if source == ImportSourceAPI || source == ImportSourceHybrid {
-		if apiFiles, err := listLocalAPIChunks(cfg.APIChunksDir()); err == nil {
-			if starts := newestChunkStarts(apiFiles, 2); len(starts) > 0 {
+	if source == ImportSourceHybrid || source == ImportSourceClickHouse {
+		if deltaFiles, err := listLocalCHChunks(cfg.ClickHouseDeltaParquetDir()); err == nil {
+			if starts := newestChunkStarts(deltaFiles, 2); len(starts) > 0 {
 				fromAPITail = starts[0]
 			}
 		}
@@ -373,10 +379,15 @@ func importIncremental(ctx context.Context, db *sql.DB, cfg Config, source Impor
 
 func createTempDeltaTable(ctx context.Context, db *sql.DB, cfg Config, source ImportSource, fromID int64) error {
 	chPattern := filepath.Join(cfg.ClickHouseParquetDir(), "*.parquet")
+	deltaPattern := filepath.Join(cfg.ClickHouseDeltaParquetDir(), "*.parquet")
 	apiPattern := filepath.Join(cfg.APIChunksDir(), "*.jsonl")
 	switch source {
 	case ImportSourceClickHouse:
-		_, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildFilteredNormalizedSelect(buildNormalizedClickHouseSelect(chPattern), fromID)))
+		inner := buildFilteredNormalizedSelect(buildNormalizedClickHouseSelect(chPattern), fromID)
+		if files, _ := sortedGlob(deltaPattern); len(files) > 0 {
+			inner = inner + ` UNION ALL ` + buildFilteredNormalizedSelect(buildNormalizedClickHouseSelect(deltaPattern), fromID)
+		}
+		_, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_delta AS `+buildSelectItemsFromNormalizedSelectSQL(inner))
 		return err
 	case ImportSourceAPI:
 		_, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildFilteredNormalizedSelect(buildNormalizedAPISelect(apiPattern), fromID)))
@@ -385,7 +396,7 @@ func createTempDeltaTable(ctx context.Context, db *sql.DB, cfg Config, source Im
 		if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildFilteredNormalizedSelect(buildNormalizedClickHouseSelect(chPattern), fromID))); err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_api_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildFilteredNormalizedSelect(buildNormalizedAPISelect(apiPattern), fromID))); err != nil {
+			if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_api_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildFilteredNormalizedSelect(buildNormalizedClickHouseSelect(deltaPattern), fromID))); err != nil {
 			return err
 		}
 		if _, err := db.ExecContext(ctx, `DELETE FROM hn_delta WHERE id IN (SELECT id FROM hn_api_delta WHERE id IS NOT NULL)`); err != nil {
@@ -402,11 +413,11 @@ func createTempDeltaTable(ctx context.Context, db *sql.DB, cfg Config, source Im
 
 func importHybrid(ctx context.Context, db *sql.DB, cfg Config) error {
 	chPattern := filepath.Join(cfg.ClickHouseParquetDir(), "*.parquet")
-	apiPattern := filepath.Join(cfg.APIChunksDir(), "*.jsonl")
+	deltaPattern := filepath.Join(cfg.ClickHouseDeltaParquetDir(), "*.parquet")
 	if _, err := db.ExecContext(ctx, buildCreateItemsFromNormalizedSelectSQL(buildNormalizedClickHouseSelect(chPattern))); err != nil {
 		return err
 	}
-	if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_api_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildNormalizedAPISelect(apiPattern))); err != nil {
+	if _, err := db.ExecContext(ctx, `CREATE TEMP TABLE hn_api_delta AS `+buildSelectItemsFromNormalizedSelectSQL(buildNormalizedClickHouseSelect(deltaPattern))); err != nil {
 		return err
 	}
 	// Overlay API rows onto the base snapshot. This is cheap because delta is typically small.

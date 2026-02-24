@@ -26,6 +26,9 @@ type LocalStatus struct {
 	CHParquetDir   string
 	CHParquetCount int
 	CHParquetBytes int64
+	CHDeltaDir     string
+	CHDeltaCount   int
+	CHDeltaBytes   int64
 	APIChunksDir   string
 	APIChunkCount  int
 	APIChunkBytes  int64
@@ -43,6 +46,7 @@ func (c Config) LocalStatus(ctx context.Context) (*LocalStatus, error) {
 		DataDir:      cfg.BaseDir(),
 		ParquetPath:  cfg.RawParquetPath(),
 		CHParquetDir: cfg.ClickHouseParquetDir(),
+		CHDeltaDir:   cfg.ClickHouseDeltaParquetDir(),
 		APIChunksDir: cfg.APIChunksDir(),
 		DBPath:       cfg.DefaultDBPath(),
 	}
@@ -57,6 +61,16 @@ func (c Config) LocalStatus(ctx context.Context) (*LocalStatus, error) {
 		for _, p := range chParquetFiles {
 			if sz, ok := fileSize(p); ok {
 				st.CHParquetBytes += sz
+			}
+		}
+	}
+
+	chDeltaFiles, err := sortedGlob(filepath.Join(st.CHDeltaDir, "*.parquet"))
+	if err == nil {
+		st.CHDeltaCount = len(chDeltaFiles)
+		for _, p := range chDeltaFiles {
+			if sz, ok := fileSize(p); ok {
+				st.CHDeltaBytes += sz
 			}
 		}
 	}

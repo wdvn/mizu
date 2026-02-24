@@ -153,28 +153,22 @@ func newHNStatus() *cobra.Command {
 func newHNDownload() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "download",
-		Short: "Download HN dataset (parquet primary, API fallback)",
+		Short: "Download/update HN dataset from ClickHouse (auto full or delta)",
 		Example: `  search hn download
-  search hn download --source clickhouse
-  search hn download --source delta
-  search hn download --source parquet
-  search hn download --source api --from-id 1 --to-id 5000
-  search hn download --source auto --no-fallback`,
+  search hn download --full
+  search hn download --from-id 47000001
+  search hn download --parallel 8`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := runHNDownload(cmd.Context(), cmd)
 			return err
 		},
 	}
-	cmd.Flags().String("source", "auto", "Download source: auto|clickhouse|delta|parquet|api")
+	cmd.Flags().Bool("full", false, "Force full ClickHouse chunk refresh into raw/clickhouse (otherwise auto delta to raw/clickhouse_delta when local data exists)")
 	cmd.Flags().Bool("force", false, "Restart download and overwrite existing local target")
-	cmd.Flags().Bool("no-fallback", false, "In auto mode, fail instead of falling back to API")
-	cmd.Flags().Bool("no-delta", false, "Skip API delta after ClickHouse download (auto/clickhouse modes)")
-	cmd.Flags().Int64("chunk-id-span", 500000, "ClickHouse mode: id range per parquet chunk")
-	cmd.Flags().Int("parallel", 4, "ClickHouse mode: parallel parquet chunk downloads")
-	cmd.Flags().Int("workers", 32, "API mode: concurrent item fetch workers")
-	cmd.Flags().Int("chunk-size", 1000, "API mode: ids per chunk file")
-	cmd.Flags().Int64("from-id", 0, "API mode: start item id (default 1)")
-	cmd.Flags().Int64("to-id", 0, "API mode: end item id (default maxitem)")
+	cmd.Flags().Int64("chunk-id-span", 500000, "ClickHouse checkpoint size for base/delta parquet chunks")
+	cmd.Flags().Int("parallel", 4, "Parallel ClickHouse parquet chunk downloads")
+	cmd.Flags().Int64("from-id", 0, "Start item id (default: auto full=1, auto delta=local high-watermark+1)")
+	cmd.Flags().Int64("to-id", 0, "End item id (default: remote max id)")
 	return cmd
 }
 
@@ -250,16 +244,12 @@ func newHNSync() *cobra.Command {
 			}
 		},
 	}
-	cmd.Flags().String("source", "auto", "Download source: auto|clickhouse|delta|parquet|api")
+	cmd.Flags().Bool("full", false, "Force full ClickHouse chunk refresh into raw/clickhouse before import")
 	cmd.Flags().Bool("force", false, "Restart download and overwrite existing local target")
-	cmd.Flags().Bool("no-fallback", false, "In auto mode, fail instead of falling back to API")
-	cmd.Flags().Bool("no-delta", false, "Skip API delta after ClickHouse download (auto/clickhouse modes)")
-	cmd.Flags().Int64("chunk-id-span", 500000, "ClickHouse mode: id range per parquet chunk")
-	cmd.Flags().Int("parallel", 4, "ClickHouse mode: parallel parquet chunk downloads")
-	cmd.Flags().Int("workers", 32, "API mode: concurrent item fetch workers")
-	cmd.Flags().Int("chunk-size", 1000, "API mode: ids per chunk file")
-	cmd.Flags().Int64("from-id", 0, "API mode: start item id (default 1)")
-	cmd.Flags().Int64("to-id", 0, "API mode: end item id (default maxitem)")
+	cmd.Flags().Int64("chunk-id-span", 500000, "ClickHouse checkpoint size for base/delta parquet chunks")
+	cmd.Flags().Int("parallel", 4, "Parallel ClickHouse parquet chunk downloads")
+	cmd.Flags().Int64("from-id", 0, "Start item id (default: auto full=1, auto delta=local high-watermark+1)")
+	cmd.Flags().Int64("to-id", 0, "End item id (default: remote max id)")
 	cmd.Flags().String("db", "", "DuckDB output path (default: $HOME/data/hn/hn.duckdb)")
 	cmd.Flags().Bool("rebuild", false, "Force full table rebuild instead of incremental merge when DB exists")
 	cmd.Flags().Duration("every", 0, "Run sync on a ticker interval (e.g. 1m, 30s)")
@@ -467,8 +457,8 @@ func showHNLocalStatus(ctx context.Context, cfg hn.Config) error {
 	} else {
 		fmt.Printf("  Parquet:     %s\n", warningStyle.Render("missing"))
 	}
-	fmt.Printf("  CH chunks:   %d file(s), %s\n", st.CHParquetCount, formatBytes(st.CHParquetBytes))
-	fmt.Printf("  API chunks:  %d file(s), %s\n", st.APIChunkCount, formatBytes(st.APIChunkBytes))
+	fmt.Printf("  CH base:     %d file(s), %s\n", st.CHParquetCount, formatBytes(st.CHParquetBytes))
+	fmt.Printf("  CH delta:    %d file(s), %s\n", st.CHDeltaCount, formatBytes(st.CHDeltaBytes))
 	if st.DBExists {
 		fmt.Printf("  DuckDB:      %s (%s)\n", successStyle.Render(filepath.Base(st.DBPath)), formatBytes(st.DBSize))
 		if st.DBRows > 0 {

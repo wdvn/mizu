@@ -12,7 +12,7 @@ type DownloadState struct {
 	CompletedAt time.Time           `json:"completed_at"`
 	SourceUsed  string              `json:"source_used"`
 	ClickHouse  *ClickHouseRunState `json:"clickhouse,omitempty"`
-	API         *APIRunState        `json:"api,omitempty"`
+	Delta       *ClickHouseRunState `json:"delta,omitempty"`
 }
 
 type ClickHouseRunState struct {
@@ -23,13 +23,6 @@ type ClickHouseRunState struct {
 	ChunkIDSpan       int64 `json:"chunk_id_span"`
 	TailRefreshChunks int   `json:"tail_refresh_chunks"`
 	IncrementalFromID int64 `json:"incremental_from_id"`
-}
-
-type APIRunState struct {
-	StartID int64 `json:"start_id"`
-	EndID   int64 `json:"end_id"`
-	MaxItem int64 `json:"max_item"`
-	IsDelta bool  `json:"is_delta"`
 }
 
 type ImportState struct {
@@ -92,6 +85,14 @@ func (st *DownloadState) IncrementalFromIDFor(source ImportSource) int64 {
 	}
 	switch source {
 	case ImportSourceClickHouse:
+		if st.Delta != nil {
+			if st.Delta.IncrementalFromID > 0 {
+				return st.Delta.IncrementalFromID
+			}
+			if st.Delta.StartID > 0 {
+				return st.Delta.StartID
+			}
+		}
 		if st.ClickHouse != nil {
 			if st.ClickHouse.IncrementalFromID > 0 {
 				return st.ClickHouse.IncrementalFromID
@@ -99,11 +100,16 @@ func (st *DownloadState) IncrementalFromIDFor(source ImportSource) int64 {
 			return st.ClickHouse.StartID
 		}
 	case ImportSourceAPI:
-		if st.API != nil {
-			return st.API.StartID
-		}
+		return 0
 	case ImportSourceHybrid:
-		var chFrom, apiFrom int64
+		var chFrom, deltaFrom int64
+		if st.Delta != nil {
+			if st.Delta.IncrementalFromID > 0 {
+				deltaFrom = st.Delta.IncrementalFromID
+			} else {
+				deltaFrom = st.Delta.StartID
+			}
+		}
 		if st.ClickHouse != nil {
 			if st.ClickHouse.IncrementalFromID > 0 {
 				chFrom = st.ClickHouse.IncrementalFromID
@@ -111,10 +117,7 @@ func (st *DownloadState) IncrementalFromIDFor(source ImportSource) int64 {
 				chFrom = st.ClickHouse.StartID
 			}
 		}
-		if st.API != nil {
-			apiFrom = st.API.StartID
-		}
-		return minPositiveInt64(chFrom, apiFrom)
+		return minPositiveInt64(deltaFrom, chFrom)
 	}
 	return 0
 }

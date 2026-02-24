@@ -37,6 +37,8 @@ type ClickHouseDownloadOptions struct {
 	ChunkIDSpan       int64
 	Parallelism       int
 	RefreshTailChunks int
+	OutputDir         string
+	AlignCheckpoints  bool
 	Force             bool
 }
 
@@ -147,9 +149,14 @@ func (c Config) DownloadClickHouseParquet(ctx context.Context, opts ClickHouseDo
 	if endID < startID {
 		return nil, fmt.Errorf("invalid id range: from=%d to=%d", startID, endID)
 	}
-	chunksTotal := int((endID-startID)/span + 1)
+	ranges := buildClickHouseChunkRanges(startID, endID, span, opts.AlignCheckpoints)
+	chunksTotal := len(ranges)
+	outDir := strings.TrimSpace(opts.OutputDir)
+	if outDir == "" {
+		outDir = cfg.ClickHouseParquetDir()
+	}
 	res := &ClickHouseDownloadResult{
-		Dir:         cfg.ClickHouseParquetDir(),
+		Dir:         outDir,
 		StartID:     startID,
 		EndID:       endID,
 		RemoteMaxID: remote.MaxID,
@@ -174,7 +181,7 @@ func (c Config) DownloadClickHouseParquet(ctx context.Context, opts ClickHouseDo
 	var mu sync.Mutex
 	active := 0
 
-	existingChunks, _ := listLocalCHChunks(cfg.ClickHouseParquetDir())
+	existingChunks, _ := listLocalCHChunks(outDir)
 	byStart := make(map[int64][]localChunkFile)
 	for _, cf := range existingChunks {
 		byStart[cf.StartID] = append(byStart[cf.StartID], cf)
@@ -253,12 +260,9 @@ func (c Config) DownloadClickHouseParquet(ctx context.Context, opts ClickHouseDo
 		emit(base)
 	}
 
-	for chunkStart := startID; chunkStart <= endID; chunkStart += span {
-		chunkEnd := chunkStart + span - 1
-		if chunkEnd > endID {
-			chunkEnd = endID
-		}
-		path := filepath.Join(cfg.ClickHouseParquetDir(), fmt.Sprintf("id_%09d_%09d.parquet", chunkStart, chunkEnd))
+	for _, r := range ranges {
+		chunkStart, chunkEnd := r[0], r[1]
+		path := filepath.Join(outDir, fmt.Sprintf("id_%09d_%09d.parquet", chunkStart, chunkEnd))
 		if opts.Force {
 			_ = os.Remove(path)
 		}
@@ -392,6 +396,32 @@ func (c Config) downloadClickHouseChunk(ctx context.Context, startID, endID int6
 		lastErr = fmt.Errorf("clickhouse chunk %d-%d failed", startID, endID)
 	}
 	return 0, lastErr
+}
+
+func buildClickHouseChunkRanges(startID, endID, span int64, alignCheckpoints bool) [][2]int64 {
+	if startID <= 0 || endID <= 0 || endID < startID || span <= 0 {
+		return nil
+	}
+	out := make([][2]int64, 0, int((endID-startID)/span)+2)
+	if !alignCheckpoints {
+		for s := startID; s <= endID; s += span {
+			e := s + span - 1
+			if e > endID {
+				e = endID
+			}
+			out = append(out, [2]int64{s, e})
+		}
+		return out
+	}
+	for s := startID; s <= endID; {
+		e := ((s-1)/span+1)*span
+		if e > endID {
+			e = endID
+		}
+		out = append(out, [2]int64{s, e})
+		s = e + 1
+	}
+	return out
 }
 
 func (c Config) clickHouseQuery(ctx context.Context, query string) ([]byte, error) {

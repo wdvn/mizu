@@ -11,8 +11,8 @@ import (
 // LocalHighWatermark summarizes the highest known local HN id across raw/downloaded/imported assets.
 type LocalHighWatermark struct {
 	FromDownloadState int64
-	FromAPIChunks     int64
 	FromCHChunks      int64
+	FromCHDelta       int64
 	FromDB            int64
 	MaxKnownID        int64
 }
@@ -22,17 +22,17 @@ func (c Config) LocalHighWatermark(ctx context.Context, dbPath string) (*LocalHi
 	out := &LocalHighWatermark{}
 
 	if st, err := cfg.ReadDownloadState(); err == nil && st != nil {
-		if st.API != nil && st.API.EndID > out.FromDownloadState {
-			out.FromDownloadState = st.API.EndID
-		}
 		if st.ClickHouse != nil && st.ClickHouse.EndID > out.FromDownloadState {
 			out.FromDownloadState = st.ClickHouse.EndID
 		}
+		if st.Delta != nil && st.Delta.EndID > out.FromDownloadState {
+			out.FromDownloadState = st.Delta.EndID
+		}
 	}
-	if apiChunks, err := listLocalAPIChunks(cfg.APIChunksDir()); err == nil {
-		for _, cf := range apiChunks {
-			if cf.EndID > out.FromAPIChunks {
-				out.FromAPIChunks = cf.EndID
+	if chDelta, err := listLocalCHChunks(cfg.ClickHouseDeltaParquetDir()); err == nil {
+		for _, cf := range chDelta {
+			if cf.EndID > out.FromCHDelta {
+				out.FromCHDelta = cf.EndID
 			}
 		}
 	}
@@ -51,8 +51,8 @@ func (c Config) LocalHighWatermark(ctx context.Context, dbPath string) (*LocalHi
 	}
 
 	out.MaxKnownID = out.FromDownloadState
-	if out.FromAPIChunks > out.MaxKnownID {
-		out.MaxKnownID = out.FromAPIChunks
+	if out.FromCHDelta > out.MaxKnownID {
+		out.MaxKnownID = out.FromCHDelta
 	}
 	if out.FromCHChunks > out.MaxKnownID {
 		out.MaxKnownID = out.FromCHChunks
@@ -63,7 +63,7 @@ func (c Config) LocalHighWatermark(ctx context.Context, dbPath string) (*LocalHi
 	return out, nil
 }
 
-func (c Config) SuggestAPIDeltaStartID(ctx context.Context, explicitFromID int64, dbPath string) (int64, *LocalHighWatermark, error) {
+func (c Config) SuggestClickHouseDeltaStartID(ctx context.Context, explicitFromID int64, dbPath string) (int64, *LocalHighWatermark, error) {
 	if explicitFromID > 0 {
 		hw, _ := c.LocalHighWatermark(ctx, dbPath)
 		return explicitFromID, hw, nil
