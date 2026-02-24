@@ -39,6 +39,22 @@ func TestHeadParquet(t *testing.T) {
 	}
 }
 
+func TestBuildClickHouseChunkRangesAligned(t *testing.T) {
+	got := buildClickHouseChunkRanges(47499908, 47500065, 500000, true)
+	want := [][2]int64{
+		{47499908, 47500000},
+		{47500001, 47500065},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("len(ranges)=%d want %d (%v)", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("range[%d]=%v want %v (all=%v)", i, got[i], want[i], got)
+		}
+	}
+}
+
 func TestDownloadParquetResume(t *testing.T) {
 	parquetBytes := []byte(strings.Repeat("abc123XYZ", 1024))
 	ts := newHNTestServer(t, parquetBytes, nil)
@@ -201,8 +217,8 @@ func TestImportHybridIncremental(t *testing.T) {
 		{ID: 1, TypeCode: 1, By: "alice", Time: 1700000000, Title: "s1"},
 		{ID: 2, TypeCode: 2, By: "bob", Time: 1700000001, Parent: sqlNullInt64(1), Text: "c2"},
 	})
-	writeAPIChunk(t, filepath.Join(cfg.APIChunksDir(), "items_000000003_000000003.jsonl"), []string{
-		`{"id":3,"type":"story","time":1700000002,"by":"carol","title":"s3-api-v1"}`,
+	createTestClickHouseParquet(t, filepath.Join(cfg.ClickHouseDeltaParquetDir(), "id_000000003_000000003.parquet"), []hnCHRow{
+		{ID: 3, TypeCode: 1, By: "carol", Time: 1700000002, Title: "s3-delta-v1"},
 	})
 
 	res1, err := cfg.Import(context.Background(), ImportOptions{Source: ImportSourceAuto})
@@ -221,17 +237,17 @@ func TestImportHybridIncremental(t *testing.T) {
 		{ID: 3, TypeCode: 1, By: "carol", Time: 1700000002, Title: "s3-ch-v2"},
 		{ID: 4, TypeCode: 1, By: "dave", Time: 1700000003, Title: "s4"},
 	})
-	if err := os.Remove(filepath.Join(cfg.APIChunksDir(), "items_000000003_000000003.jsonl")); err != nil {
-		t.Fatalf("remove old api chunk: %v", err)
+	if err := os.Remove(filepath.Join(cfg.ClickHouseDeltaParquetDir(), "id_000000003_000000003.parquet")); err != nil {
+		t.Fatalf("remove old delta chunk: %v", err)
 	}
-	writeAPIChunk(t, filepath.Join(cfg.APIChunksDir(), "items_000000003_000000005.jsonl"), []string{
-		`{"id":3,"type":"story","time":1700000002,"by":"carol","title":"s3-api-v2"}`,
-		`{"id":5,"type":"job","time":1700000004,"by":"erin","title":"j5"}`,
+	createTestClickHouseParquet(t, filepath.Join(cfg.ClickHouseDeltaParquetDir(), "id_000000003_000000005.parquet"), []hnCHRow{
+		{ID: 3, TypeCode: 1, By: "carol", Time: 1700000002, Title: "s3-delta-v2"},
+		{ID: 5, TypeCode: 5, By: "erin", Time: 1700000004, Title: "j5"},
 	})
 	if err := cfg.WriteDownloadState(&DownloadState{
 		SourceUsed: "hybrid",
 		ClickHouse: &ClickHouseRunState{StartID: 1, EndID: 4, ChunkIDSpan: 2, IncrementalFromID: 3},
-		API:        &APIRunState{StartID: 3, EndID: 5, MaxItem: 5, IsDelta: true},
+		Delta:      &ClickHouseRunState{StartID: 3, EndID: 5, ChunkIDSpan: 2, IncrementalFromID: 3},
 	}); err != nil {
 		t.Fatalf("WriteDownloadState: %v", err)
 	}
@@ -259,8 +275,8 @@ func TestImportHybridIncremental(t *testing.T) {
 	if err := db.QueryRow(`SELECT title FROM items WHERE id=3`).Scan(&title3); err != nil {
 		t.Fatalf("query id=3 title: %v", err)
 	}
-	if title3 != "s3-api-v2" {
-		t.Fatalf("id=3 title=%q want api overlay update", title3)
+	if title3 != "s3-delta-v2" {
+		t.Fatalf("id=3 title=%q want delta overlay update", title3)
 	}
 }
 
@@ -304,13 +320,13 @@ func TestCompactDeltaToClickHouseParquet(t *testing.T) {
 		{ID: 1, TypeCode: 1, By: "alice", Time: 1700000000, Title: "story-1"},
 		{ID: 2, TypeCode: 2, By: "bob", Time: 1700000001, Parent: sqlNullInt64(1), Text: "old-comment"},
 	})
-	writeAPIChunk(t, filepath.Join(cfg.APIChunksDir(), "items_000000002_000000003.jsonl"), []string{
-		`{"id":2,"type":"comment","time":1700000001,"by":"bob","parent":1,"text":"new-comment"}`,
-		`{"id":3,"type":"job","time":1700000002,"by":"carol","title":"job-3"}`,
+	createTestClickHouseParquet(t, filepath.Join(cfg.ClickHouseDeltaParquetDir(), "id_000000002_000000003.parquet"), []hnCHRow{
+		{ID: 2, TypeCode: 2, By: "bob", Time: 1700000001, Parent: sqlNullInt64(1), Text: "new-comment"},
+		{ID: 3, TypeCode: 5, By: "carol", Time: 1700000002, Title: "job-3"},
 	})
 	if err := cfg.WriteDownloadState(&DownloadState{
 		SourceUsed: "hybrid",
-		API:        &APIRunState{StartID: 2, EndID: 3, MaxItem: 3, IsDelta: true},
+		Delta:      &ClickHouseRunState{StartID: 2, EndID: 3, ChunkIDSpan: 1000, IncrementalFromID: 2},
 		ClickHouse: &ClickHouseRunState{StartID: 1, EndID: 2, ChunkIDSpan: 1000, IncrementalFromID: 1},
 	}); err != nil {
 		t.Fatalf("WriteDownloadState: %v", err)
@@ -354,12 +370,25 @@ func TestCompactDeltaToClickHouseParquet(t *testing.T) {
 
 func TestExportMonthlyParquet(t *testing.T) {
 	cfg := Config{DataDir: t.TempDir()}
-	dbPath := filepath.Join(cfg.BaseDir(), "hn.duckdb")
-	makeItemsDBForExport(t, dbPath)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		q := string(body)
+		if strings.Contains(q, "GROUP BY ym") && strings.Contains(q, "FORMAT JSONEachRow") {
+			_, _ = io.WriteString(w, `{"ym":"2023-11","n":"2"}`+"\n"+`{"ym":"2023-12","n":"1"}`+"\n")
+			return
+		}
+		if strings.Contains(q, "FORMAT Parquet") {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("PAR1fake"))
+			return
+		}
+		http.Error(w, "unexpected query", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	cfg.ClickHouseBaseURL = srv.URL
 	outDir := filepath.Join(cfg.BaseDir(), "export-test")
 
 	res1, err := cfg.ExportMonthlyParquet(context.Background(), ExportOptions{
-		DBPath:        dbPath,
 		OutDir:        outDir,
 		RefreshLatest: true,
 	})
@@ -374,7 +403,6 @@ func TestExportMonthlyParquet(t *testing.T) {
 	}
 
 	res2, err := cfg.ExportMonthlyParquet(context.Background(), ExportOptions{
-		DBPath:        dbPath,
 		OutDir:        outDir,
 		RefreshLatest: true,
 	})
@@ -383,6 +411,65 @@ func TestExportMonthlyParquet(t *testing.T) {
 	}
 	if res2.MonthsSkipped != 1 || res2.MonthsWritten != 1 {
 		t.Fatalf("second run scanned=%d written=%d skipped=%d want written=1 skipped=1", res2.MonthsScanned, res2.MonthsWritten, res2.MonthsSkipped)
+	}
+}
+
+func TestExportMonthlyParquet_PrefersDuckDBAndSkipsLatestUnchanged(t *testing.T) {
+	cfg := Config{DataDir: t.TempDir()}
+	makeItemsDBForExport(t, cfg.DefaultDBPath())
+	outDir := filepath.Join(cfg.BaseDir(), "export-test-local")
+
+	var progress1 []ExportProgress
+	res1, err := cfg.ExportMonthlyParquet(context.Background(), ExportOptions{
+		OutDir:        outDir,
+		RefreshLatest: true,
+		Progress: func(p ExportProgress) {
+			progress1 = append(progress1, p)
+		},
+	})
+	if err != nil {
+		t.Fatalf("ExportMonthlyParquet local first: %v", err)
+	}
+	if res1.SourceUsed != "duckdb" {
+		t.Fatalf("SourceUsed=%q want duckdb", res1.SourceUsed)
+	}
+	if res1.MonthsWritten != 2 {
+		t.Fatalf("MonthsWritten=%d want 2", res1.MonthsWritten)
+	}
+	if !fileExistsNonEmpty(filepath.Join(outDir, "items_2023_11.parquet")) || !fileExistsNonEmpty(filepath.Join(outDir, "items_2023_12.parquet")) {
+		t.Fatalf("expected exported month parquet files from local duckdb")
+	}
+	if len(progress1) == 0 {
+		t.Fatalf("expected progress events")
+	}
+
+	res2, err := cfg.ExportMonthlyParquet(context.Background(), ExportOptions{
+		OutDir:        outDir,
+		RefreshLatest: true,
+	})
+	if err != nil {
+		t.Fatalf("ExportMonthlyParquet local second: %v", err)
+	}
+	if res2.SourceUsed != "duckdb" {
+		t.Fatalf("second SourceUsed=%q want duckdb", res2.SourceUsed)
+	}
+	if res2.MonthsSkipped != 2 || res2.MonthsWritten != 0 {
+		t.Fatalf("second run written=%d skipped=%d want written=0 skipped=2", res2.MonthsWritten, res2.MonthsSkipped)
+	}
+	var latest ExportMonth
+	foundLatest := false
+	for _, m := range res2.Months {
+		if m.Month == res2.LatestMonth {
+			latest = m
+			foundLatest = true
+			break
+		}
+	}
+	if !foundLatest {
+		t.Fatalf("latest month %q not found in result months", res2.LatestMonth)
+	}
+	if latest.SkipReason != "latest_unchanged" {
+		t.Fatalf("latest skip reason=%q want latest_unchanged", latest.SkipReason)
 	}
 }
 

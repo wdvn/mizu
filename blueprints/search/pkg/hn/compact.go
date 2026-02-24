@@ -157,12 +157,12 @@ WHERE try_cast(id AS BIGINT) BETWEEN %d AND %d`, escapeSQLString(deltaPattern), 
 	if err != nil {
 		return nil, fmt.Errorf("list touched chunks: %w", err)
 	}
-	for rows.Next() {
-		var tc touchedChunk
-		if err := rows.Scan(&tc.ChunkStart, &tc.APIMaxID, &tc.APIRows); err != nil {
-			rows.Close()
-			return nil, fmt.Errorf("scan touched chunk: %w", err)
-		}
+		for rows.Next() {
+			var tc touchedChunk
+			if err := rows.Scan(&tc.ChunkStart, &tc.DeltaMaxID, &tc.DeltaRows); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("scan touched chunk: %w", err)
+			}
 		touched = append(touched, tc)
 	}
 	rows.Close()

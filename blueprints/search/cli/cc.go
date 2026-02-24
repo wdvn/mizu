@@ -1004,6 +1004,7 @@ Examples:
 				importOnly:         importOnly,
 				filter:             filter,
 				workers:            workers,
+				workersExplicit:    cmd.Flags().Changed("workers"),
 				dnsWorkers:         dnsWorkers,
 				dnsTimeout:         dnsTimeout,
 				dnsWorkersExplicit: cmd.Flags().Changed("dns-workers"),
@@ -1026,7 +1027,7 @@ Examples:
 	cmd.Flags().StringVar(&file, "file", "", "Parquet selector/path: N (warc/part index), p:N, w:N, m:N, or local path")
 	cmd.Flags().IntVar(&sample, "sample", 1, "Number of parquet files to download (0=all, legacy mode)")
 	cmd.Flags().BoolVar(&importOnly, "import-only", false, "Skip parquet download, use existing DuckDB index")
-	cmd.Flags().IntVar(&workers, "workers", 50000, "HTTP fetch workers")
+	cmd.Flags().IntVar(&workers, "workers", 5000, "HTTP fetch workers")
 	cmd.Flags().IntVar(&dnsWorkers, "dns-workers", 2000, "DNS resolution workers (use 0 for auto)")
 	cmd.Flags().IntVar(&dnsTimeout, "dns-timeout", 2000, "DNS timeout in ms (use 0 for auto)")
 	cmd.Flags().IntVar(&timeout, "timeout", 5000, "HTTP timeout in ms")
@@ -1056,6 +1057,7 @@ type ccRecrawlOpts struct {
 	importOnly         bool
 	filter             cc.IndexFilter
 	workers            int
+	workersExplicit    bool
 	dnsWorkers         int
 	dnsTimeout         int
 	dnsWorkersExplicit bool
@@ -1084,6 +1086,13 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 
 	ccCfg := cc.DefaultConfig()
 	ccCfg.CrawlID = opts.crawlID
+
+	if !opts.workersExplicit && opts.workers > 10000 {
+		fmt.Println(warningStyle.Render(fmt.Sprintf("Clamping workers from %d to 10000 to avoid local socket exhaustion", opts.workers)))
+		fmt.Println(labelStyle.Render("  Use --workers to override if you intentionally tuned OS limits for higher concurrency"))
+		fmt.Println()
+		opts.workers = 10000
+	}
 
 	if crawlNote != "" {
 		fmt.Println(labelStyle.Render(fmt.Sprintf("Using defaults")))
@@ -1245,11 +1254,6 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 		MaxConnsPerDomain: opts.maxConnsPerDomain,
 		DNSPrefetch:       opts.dnsPrefetch,
 		BatchSize:         opts.batchSize,
-	}
-	if opts.statusOnly || opts.headOnly {
-		// High-throughput modes benefit from aggressive dead-domain culling.
-		// This reduces repeated timeout storms on domains that never succeed.
-		recrawlCfg.DomainFailThreshold = 1
 	}
 
 	resultDir := ccCfg.RecrawlDir()

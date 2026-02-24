@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -16,38 +15,37 @@ import (
 func NewHN() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hn",
-		Short: "Hacker News dataset download/import (parquet + API fallback)",
-		Long: `Download and import all Hacker News data using a fast bulk parquet source
-with an official HN API fallback.
+		Short: "Hacker News dataset sync/import (ClickHouse-only)",
+		Long: `Download, incrementally update, and import the full Hacker News dataset
+using ClickHouse as the only remote source.
 
 Data is stored at $HOME/data/hn/ by default:
-  raw/items.parquet        primary parquet snapshot (resumable HTTP download)
-  raw/api/chunks/*.jsonl   chunked API fallback downloads (resumable by chunk)
-  hn.duckdb                imported DuckDB database
+  raw/clickhouse/*.parquet        base checkpoint parquet chunks
+  raw/clickhouse_delta/*.parquet  incremental delta parquet chunks (checkpoint-aligned)
+  hn.duckdb                       imported DuckDB database
 
-Examples:
+Recommended workflow:
+  search hn sync                 # download delta (or full on first run) + import
+  search hn sync --every 1m      # keep polling for new items
+  search hn compact              # merge delta parquet back into base partitions
+  search hn export               # export monthly parquet directly from ClickHouse
+
+Other commands:
   search hn list
   search hn download
-  search hn download --source parquet
-  search hn download --source api --from-id 1 --to-id 5000
   search hn import
-  search hn status
-  search hn sync`,
+  search hn status`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
 		},
 	}
 
 	cmd.PersistentFlags().String("dir", "", "Override HN data dir (default: $HOME/data/hn)")
-	cmd.PersistentFlags().String("parquet-url", "", "Override HN parquet URL")
-	cmd.PersistentFlags().String("api-base-url", "", "Override HN API base URL")
 	cmd.PersistentFlags().String("clickhouse-url", "", "Override ClickHouse SQL playground HTTP URL")
 	cmd.PersistentFlags().String("clickhouse-user", "", "Override ClickHouse HTTP user")
 	cmd.PersistentFlags().String("clickhouse-database", "", "Override ClickHouse database")
 	cmd.PersistentFlags().String("clickhouse-table", "", "Override ClickHouse table")
 	_ = cmd.PersistentFlags().MarkHidden("dir")
-	_ = cmd.PersistentFlags().MarkHidden("parquet-url")
-	_ = cmd.PersistentFlags().MarkHidden("api-base-url")
 	_ = cmd.PersistentFlags().MarkHidden("clickhouse-url")
 	_ = cmd.PersistentFlags().MarkHidden("clickhouse-user")
 	_ = cmd.PersistentFlags().MarkHidden("clickhouse-database")
@@ -67,12 +65,6 @@ func hnConfigFromCmd(cmd *cobra.Command) hn.Config {
 	var cfg hn.Config
 	if v, _ := cmd.Flags().GetString("dir"); strings.TrimSpace(v) != "" {
 		cfg.DataDir = v
-	}
-	if v, _ := cmd.Flags().GetString("parquet-url"); strings.TrimSpace(v) != "" {
-		cfg.ParquetURL = v
-	}
-	if v, _ := cmd.Flags().GetString("api-base-url"); strings.TrimSpace(v) != "" {
-		cfg.APIBaseURL = v
 	}
 	if v, _ := cmd.Flags().GetString("clickhouse-url"); strings.TrimSpace(v) != "" {
 		cfg.ClickHouseBaseURL = v
@@ -121,18 +113,6 @@ func newHNList() *cobra.Command {
 			fmt.Printf("  Max Time:    %s\n", successStyle.Render(chInfo.MaxTime))
 			fmt.Printf("  Checked:     %s\n", labelStyle.Render(chInfo.CheckedAt.Format("2006-01-02 15:04:05 MST")))
 
-			fmt.Println()
-			fmt.Println(labelStyle.Render("Static snapshot fallback (legacy):"))
-			info, err := cfg.HeadParquet(ctx)
-			if err != nil {
-				fmt.Printf("  %s %v\n", warningStyle.Render("WARN"), err)
-				return nil
-			}
-			fmt.Printf("  URL:         %s\n", labelStyle.Render(info.URL))
-			fmt.Printf("  Size:        %s\n", labelStyle.Render(formatBytes(info.Size)))
-			if info.LastModified != "" {
-				fmt.Printf("  Updated:     %s\n", labelStyle.Render(info.LastModified))
-			}
 			return nil
 		},
 	}
@@ -143,9 +123,9 @@ func newHNList() *cobra.Command {
 func newHNStatus() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Show local HN status (files + DuckDB)",
+		Short: "Show detailed local HN status and remote ClickHouse freshness",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return showHNLocalStatus(cmd.Context(), hnConfigFromCmd(cmd))
+			return showHNStatus(cmd.Context(), hnConfigFromCmd(cmd))
 		},
 	}
 }
@@ -179,8 +159,7 @@ func newHNImport() *cobra.Command {
 		Example: `  search hn import
   search hn import --source clickhouse
   search hn import --source hybrid
-  search hn import --source parquet
-  search hn import --source api`,
+  search hn import --rebuild`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := hnConfigFromCmd(cmd)
 			sourceStr, _ := cmd.Flags().GetString("source")
@@ -191,6 +170,12 @@ func newHNImport() *cobra.Command {
 				return err
 			}
 			fmt.Println(infoStyle.Render("Importing Hacker News data into DuckDB..."))
+			if strings.TrimSpace(dbPath) == "" {
+				dbPath = cfg.WithDefaults().DefaultDBPath()
+			}
+			fmt.Printf("  Source:      %s\n", labelStyle.Render(strings.ToLower(strings.TrimSpace(sourceStr))))
+			fmt.Printf("  DuckDB:      %s\n", labelStyle.Render(dbPath))
+			fmt.Printf("  Mode hint:   %s\n", labelStyle.Render(ternary(rebuild, "rebuild", "incremental if DB exists")))
 			res, err := cfg.Import(cmd.Context(), hn.ImportOptions{Source: source, DBPath: dbPath, Rebuild: rebuild})
 			if err != nil {
 				return err
@@ -199,7 +184,7 @@ func newHNImport() *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().String("source", "auto", "Import source: auto|clickhouse|hybrid|parquet|api")
+	cmd.Flags().String("source", "auto", "Import source: auto|clickhouse|hybrid")
 	cmd.Flags().String("db", "", "DuckDB output path (default: $HOME/data/hn/hn.duckdb)")
 	cmd.Flags().Bool("rebuild", false, "Force full table rebuild instead of incremental merge when DB exists")
 	return cmd
@@ -260,24 +245,24 @@ func newHNSync() *cobra.Command {
 func newHNCompact() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "compact",
-		Short: "Merge local API delta chunks back into ClickHouse chunk parquet files",
-		Long: `Reads local raw/api/chunks/*.jsonl, converts them to a ClickHouse-compatible parquet schema
-and merges them into local raw/clickhouse/id_<start>_<end>.parquet partitions using DuckDB.`,
+		Short: "Merge local ClickHouse delta parquet chunks back into base parquet files",
+		Long: `Reads local raw/clickhouse_delta/*.parquet and merges them into
+raw/clickhouse/id_<start>_<end>.parquet partitions using DuckDB.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := hnConfigFromCmd(cmd)
 			fromID, _ := cmd.Flags().GetInt64("from-id")
 			toID, _ := cmd.Flags().GetInt64("to-id")
 			chunkSpan, _ := cmd.Flags().GetInt64("chunk-id-span")
 			compLevel, _ := cmd.Flags().GetInt("compression-level")
-			pruneAPI, _ := cmd.Flags().GetBool("prune-api")
+			pruneDelta, _ := cmd.Flags().GetBool("prune-delta")
 
-			fmt.Println(infoStyle.Render("Compacting API delta into ClickHouse parquet partitions..."))
+			fmt.Println(infoStyle.Render("Compacting ClickHouse delta parquet into base partitions..."))
 			res, err := cfg.CompactDeltaToClickHouseParquet(cmd.Context(), hn.CompactOptions{
 				FromID:           fromID,
 				ToID:             toID,
 				ChunkIDSpan:      chunkSpan,
 				CompressionLevel: compLevel,
-				PruneAPI:         pruneAPI,
+				PruneDelta:       pruneDelta,
 			})
 			if err != nil {
 				return err
@@ -285,9 +270,9 @@ and merges them into local raw/clickhouse/id_<start>_<end>.parquet partitions us
 			fmt.Printf("  %s  Dir: %s\n", successStyle.Render("OK"), labelStyle.Render(res.Dir))
 			fmt.Printf("  Range:      %s\n", labelStyle.Render(formatHNRange(res.FromID, res.ToID)))
 			fmt.Printf("  Chunk span: %s\n", labelStyle.Render(formatInt64Exact(res.ChunkIDSpan)))
-			fmt.Printf("  API rows:   %s (%s)\n", labelStyle.Render(formatLargeNumber(res.APIRows)), labelStyle.Render(formatInt64Exact(res.APIRows)))
+			fmt.Printf("  Delta rows: %s (%s)\n", labelStyle.Render(formatLargeNumber(res.DeltaRows)), labelStyle.Render(formatInt64Exact(res.DeltaRows)))
 			fmt.Printf("  Chunks:     touched=%d written=%d skipped=%d\n", res.ChunksTouched, res.ChunksWritten, res.ChunksSkipped)
-			fmt.Printf("  Pruned:     parquet=%d api_chunks=%d\n", res.FilesPruned, res.APIChunksPruned)
+			fmt.Printf("  Pruned:     parquet=%d delta_chunks=%d\n", res.FilesPruned, res.DeltaFilesPruned)
 			fmt.Printf("  Elapsed:    %s\n", labelStyle.Render(formatDuration(res.Elapsed)))
 			for _, ch := range res.Chunks {
 				fmt.Printf("    %s rows=%s path=%s\n",
@@ -299,47 +284,77 @@ and merges them into local raw/clickhouse/id_<start>_<end>.parquet partitions us
 			return nil
 		},
 	}
-	cmd.Flags().Int64("from-id", 0, "Compact only API delta rows >= this id (default: infer from download state/API chunks)")
-	cmd.Flags().Int64("to-id", 0, "Compact only API delta rows <= this id (default: infer from download state/API chunks)")
+	cmd.Flags().Int64("from-id", 0, "Compact only delta rows >= this id (default: infer from download state/delta chunks)")
+	cmd.Flags().Int64("to-id", 0, "Compact only delta rows <= this id (default: infer from download state/delta chunks)")
 	cmd.Flags().Int64("chunk-id-span", 0, "ClickHouse chunk id span (default: auto-detect local chunk span)")
 	cmd.Flags().Int("compression-level", 22, "Parquet zstd compression level for rewritten chunk files")
-	cmd.Flags().Bool("prune-api", false, "Delete API jsonl chunk files fully covered by the compacted id range")
+	cmd.Flags().Bool("prune-delta", false, "Delete ClickHouse delta parquet chunk files fully covered by the compacted id range")
 	return cmd
 }
 
 func newHNExport() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "export",
-		Short: "Export HN items from DuckDB into monthly parquet files",
+		Short: "Export HN items by month from ClickHouse into parquet files",
 		Example: `  search hn export
   search hn export --from-month 2006-10 --to-month 2006-12
   search hn export --out-dir ~/data/hn/export/monthly
   search hn export --force`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cfg := hnConfigFromCmd(cmd)
-			dbPath, _ := cmd.Flags().GetString("db")
 			outDir, _ := cmd.Flags().GetString("out-dir")
 			fromMonth, _ := cmd.Flags().GetString("from-month")
 			toMonth, _ := cmd.Flags().GetString("to-month")
 			force, _ := cmd.Flags().GetBool("force")
 			refreshLatest, _ := cmd.Flags().GetBool("refresh-latest")
-			compLevel, _ := cmd.Flags().GetInt("compression-level")
 
 			fmt.Println(infoStyle.Render("Exporting HN items by month to parquet..."))
+			if strings.TrimSpace(outDir) == "" {
+				outDir = filepath.Join(cfg.WithDefaults().BaseDir(), "export", "hn", "monthly")
+			}
+			fmt.Printf("  Output dir:  %s\n", labelStyle.Render(outDir))
+			if strings.TrimSpace(fromMonth) != "" || strings.TrimSpace(toMonth) != "" {
+				fmt.Printf("  Range:       %s .. %s\n",
+					labelStyle.Render(ternary(strings.TrimSpace(fromMonth) != "", fromMonth, "(start)")),
+					labelStyle.Render(ternary(strings.TrimSpace(toMonth) != "", toMonth, "(end)")),
+				)
+			}
 			res, err := cfg.ExportMonthlyParquet(cmd.Context(), hn.ExportOptions{
-				DBPath:           dbPath,
-				OutDir:           outDir,
-				FromMonth:        fromMonth,
-				ToMonth:          toMonth,
-				Force:            force,
-				RefreshLatest:    refreshLatest,
-				CompressionLevel: compLevel,
+				OutDir:        outDir,
+				FromMonth:     fromMonth,
+				ToMonth:       toMonth,
+				Force:         force,
+				RefreshLatest: refreshLatest,
+				Progress: func(p hn.ExportProgress) {
+					switch p.Stage {
+					case "start":
+						fmt.Printf("  Source:      %s (%s)\n", successStyle.Render(strings.ToUpper(p.SourceUsed)), labelStyle.Render(p.SourceDetail))
+						fmt.Printf("  Export to:   %s\n", labelStyle.Render(p.OutDir))
+					case "month_start":
+						fmt.Printf("  [%d/%d] %s rows=%s -> %s\n",
+							p.MonthIndex, p.MonthTotal,
+							labelStyle.Render(p.Month),
+							labelStyle.Render(formatInt64Exact(p.Rows)),
+							labelStyle.Render(p.Path),
+						)
+					case "month_done":
+						if p.Skipped {
+							reason := p.SkipReason
+							if strings.TrimSpace(reason) == "" {
+								reason = "skipped"
+							}
+							fmt.Printf("      %s %s (%s)\n", labelStyle.Render("skip"), labelStyle.Render(p.Month), labelStyle.Render(reason))
+						} else {
+							fmt.Printf("      %s %s\n", successStyle.Render("wrote"), labelStyle.Render(p.Month))
+						}
+					}
+				},
 			})
 			if err != nil {
 				return err
 			}
 			fmt.Printf("  %s  Out dir: %s\n", successStyle.Render("OK"), labelStyle.Render(res.OutDir))
-			fmt.Printf("  DB:         %s\n", labelStyle.Render(res.DBPath))
+			fmt.Printf("  Source:     %s (%s)\n", successStyle.Render(strings.ToUpper(res.SourceUsed)), labelStyle.Render(res.SourceDetail))
 			if strings.TrimSpace(res.LatestMonth) != "" {
 				fmt.Printf("  Latest:     %s\n", labelStyle.Render(res.LatestMonth))
 			}
@@ -361,17 +376,18 @@ func newHNExport() *cobra.Command {
 					labelStyle.Render(formatBytes(m.Size)),
 					labelStyle.Render(m.Path),
 				)
+				if m.Skipped && strings.TrimSpace(m.SkipReason) != "" {
+					fmt.Printf("      reason=%s\n", labelStyle.Render(m.SkipReason))
+				}
 			}
 			return nil
 		},
 	}
-	cmd.Flags().String("db", "", "DuckDB path (default: $HOME/data/hn/hn.duckdb)")
 	cmd.Flags().String("out-dir", "", "Output directory (default: $HOME/data/hn/export/hn/monthly)")
 	cmd.Flags().String("from-month", "", "Start month inclusive (YYYY-MM)")
 	cmd.Flags().String("to-month", "", "End month inclusive (YYYY-MM)")
 	cmd.Flags().Bool("force", false, "Rewrite all selected month parquet files even if they already exist")
 	cmd.Flags().Bool("refresh-latest", true, "Rewrite the latest month file if it already exists (even when skipping older months)")
-	cmd.Flags().Int("compression-level", 22, "Parquet zstd compression level (DuckDB COPY)")
 	return cmd
 }
 
@@ -393,6 +409,7 @@ func runHNSyncOnce(ctx context.Context, cmd *cobra.Command, run int) error {
 	} else {
 		fmt.Println(infoStyle.Render("Importing downloaded data..."))
 	}
+	fmt.Printf("  Import DB:   %s\n", labelStyle.Render(ternary(strings.TrimSpace(dbPath) != "", dbPath, cfg.WithDefaults().DefaultDBPath())))
 	res, err := cfg.Import(ctx, hn.ImportOptions{Source: importSource, DBPath: dbPath, Rebuild: rebuild})
 	if err != nil {
 		return err
@@ -452,20 +469,43 @@ func showHNLocalStatus(ctx context.Context, cfg hn.Config) error {
 	}
 	fmt.Println(infoStyle.Render("Local HN status:"))
 	fmt.Printf("  Data dir:    %s\n", labelStyle.Render(st.DataDir))
-	if st.ParquetExists {
-		fmt.Printf("  Parquet:     %s (%s)\n", successStyle.Render(filepath.Base(st.ParquetPath)), formatBytes(st.ParquetSize))
-	} else {
-		fmt.Printf("  Parquet:     %s\n", warningStyle.Render("missing"))
-	}
 	fmt.Printf("  CH base:     %d file(s), %s\n", st.CHParquetCount, formatBytes(st.CHParquetBytes))
+	if st.CHParquetCount > 0 {
+		if st.CHParquetSpan > 0 {
+			fmt.Printf("    span:      %s ids/chunk\n", labelStyle.Render(formatInt64Exact(st.CHParquetSpan)))
+		}
+		fmt.Printf("    range:     %s\n", labelStyle.Render(formatHNRange(st.CHParquetMinID, st.CHParquetMaxID)))
+		if st.CHParquetRows > 0 {
+			fmt.Printf("    rows:      %s (%s)\n", successStyle.Render(formatLargeNumber(st.CHParquetRows)), labelStyle.Render(formatInt64Exact(st.CHParquetRows)))
+		}
+		if strings.TrimSpace(st.CHParquetMaxTime) != "" {
+			fmt.Printf("    max time:  %s\n", labelStyle.Render(st.CHParquetMaxTime))
+		}
+	}
 	fmt.Printf("  CH delta:    %d file(s), %s\n", st.CHDeltaCount, formatBytes(st.CHDeltaBytes))
+	if st.CHDeltaCount > 0 {
+		if st.CHDeltaSpan > 0 {
+			fmt.Printf("    span:      %s ids/chunk\n", labelStyle.Render(formatInt64Exact(st.CHDeltaSpan)))
+		}
+		fmt.Printf("    range:     %s\n", labelStyle.Render(formatHNRange(st.CHDeltaMinID, st.CHDeltaMaxID)))
+		fmt.Printf("    rows:      %s (%s)\n", successStyle.Render(formatLargeNumber(st.CHDeltaRows)), labelStyle.Render(formatInt64Exact(st.CHDeltaRows)))
+		if strings.TrimSpace(st.CHDeltaMaxTime) != "" {
+			fmt.Printf("    max time:  %s\n", labelStyle.Render(st.CHDeltaMaxTime))
+		}
+	}
 	if st.DBExists {
 		fmt.Printf("  DuckDB:      %s (%s)\n", successStyle.Render(filepath.Base(st.DBPath)), formatBytes(st.DBSize))
 		if st.DBRows > 0 {
-			fmt.Printf("  Rows:        %s\n", successStyle.Render(formatLargeNumber(st.DBRows)))
+			fmt.Printf("    rows:      %s (%s)\n", successStyle.Render(formatLargeNumber(st.DBRows)), labelStyle.Render(formatInt64Exact(st.DBRows)))
+		}
+		if st.DBMaxID > 0 || st.DBMinID > 0 {
+			fmt.Printf("    range:     %s\n", labelStyle.Render(formatHNRange(st.DBMinID, st.DBMaxID)))
+		}
+		if strings.TrimSpace(st.DBMaxTime) != "" {
+			fmt.Printf("    max time:  %s\n", labelStyle.Render(st.DBMaxTime))
 		}
 		if len(st.DBTypes) > 0 {
-			fmt.Printf("  Types:       ")
+			fmt.Printf("    types:     ")
 			for i, tc := range st.DBTypes {
 				if i > 0 {
 					fmt.Print(", ")
@@ -484,381 +524,211 @@ func showHNLocalStatus(ctx context.Context, cfg hn.Config) error {
 	return nil
 }
 
+func showHNStatus(ctx context.Context, cfg hn.Config) error {
+	if err := showHNLocalStatus(ctx, cfg); err != nil {
+		return err
+	}
+	fmt.Println()
+	fmt.Println(infoStyle.Render("Remote ClickHouse status:"))
+	remote, err := cfg.ClickHouseInfo(ctx)
+	if err != nil {
+		fmt.Printf("  %s %v\n", warningStyle.Render("WARN"), err)
+		return nil
+	}
+	fmt.Printf("  Endpoint:    %s\n", labelStyle.Render(remote.BaseURL))
+	fmt.Printf("  Table:       %s.%s\n", successStyle.Render(remote.Database), successStyle.Render(remote.Table))
+	fmt.Printf("  Rows:        %s (%s)\n", successStyle.Render(formatLargeNumber(remote.Count)), successStyle.Render(formatInt64Exact(remote.Count)))
+	fmt.Printf("  Max ID:      %s (%s)\n", successStyle.Render(formatLargeNumber(remote.MaxID)), successStyle.Render(formatInt64Exact(remote.MaxID)))
+	fmt.Printf("  Max Time:    %s\n", labelStyle.Render(remote.MaxTime))
+	fmt.Printf("  Checked:     %s\n", labelStyle.Render(remote.CheckedAt.Format("2006-01-02 15:04:05 MST")))
+
+	hw, hwErr := cfg.LocalHighWatermark(ctx, "")
+	if hwErr == nil && hw != nil {
+		fmt.Println()
+		fmt.Println(labelStyle.Render("Freshness:"))
+		fmt.Printf("  Local max:   %s (db=%s base=%s delta=%s state=%s)\n",
+			labelStyle.Render(formatInt64Exact(hw.MaxKnownID)),
+			labelStyle.Render(formatInt64Exact(hw.FromDB)),
+			labelStyle.Render(formatInt64Exact(hw.FromCHChunks)),
+			labelStyle.Render(formatInt64Exact(hw.FromCHDelta)),
+			labelStyle.Render(formatInt64Exact(hw.FromDownloadState)),
+		)
+		diff := remote.MaxID - hw.MaxKnownID
+		switch {
+		case diff > 0:
+			fmt.Printf("  Status:      %s %s new item id(s) available on ClickHouse\n",
+				warningStyle.Render("BEHIND"),
+				warningStyle.Render(formatInt64Exact(diff)),
+			)
+		case diff == 0:
+			fmt.Printf("  Status:      %s local data is up to date by max id\n", successStyle.Render("UP-TO-DATE"))
+		default:
+			fmt.Printf("  Status:      %s local max id is ahead of remote by %s (transient/source lag?)\n",
+				warningStyle.Render("AHEAD"),
+				labelStyle.Render(formatInt64Exact(-diff)),
+			)
+		}
+	}
+	return nil
+}
+
 func runHNDownload(ctx context.Context, cmd *cobra.Command) (string, error) {
 	cfg := hnConfigFromCmd(cmd)
-	sourceStr, _ := cmd.Flags().GetString("source")
+	full, _ := cmd.Flags().GetBool("full")
 	force, _ := cmd.Flags().GetBool("force")
-	noFallback, _ := cmd.Flags().GetBool("no-fallback")
-	noDelta, _ := cmd.Flags().GetBool("no-delta")
 	chunkIDSpan, _ := cmd.Flags().GetInt64("chunk-id-span")
 	parallel, _ := cmd.Flags().GetInt("parallel")
-	workers, _ := cmd.Flags().GetInt("workers")
-	chunkSize, _ := cmd.Flags().GetInt("chunk-size")
 	fromID, _ := cmd.Flags().GetInt64("from-id")
 	toID, _ := cmd.Flags().GetInt64("to-id")
+	dbPath, _ := cmd.Flags().GetString("db")
 
-	source := strings.ToLower(strings.TrimSpace(sourceStr))
-	if source == "" {
-		source = "auto"
-	}
-	if source != "auto" && source != "clickhouse" && source != "delta" && source != "parquet" && source != "api" {
-		return "", fmt.Errorf("invalid --source %q (want auto|clickhouse|delta|parquet|api)", sourceStr)
-	}
-	if (source == "auto" || source == "clickhouse") && !cmd.Flags().Changed("chunk-id-span") {
+	if !cmd.Flags().Changed("chunk-id-span") {
 		if span, ok := cfg.DetectLocalClickHouseChunkSpan(); ok && span > 0 && span != chunkIDSpan {
 			fmt.Printf("  %s using local ClickHouse chunk span %d (detected from existing files)\n", labelStyle.Render("Info:"), span)
 			chunkIDSpan = span
 		}
 	}
+	if chunkIDSpan <= 0 {
+		chunkIDSpan = 500_000
+	}
+	fmt.Printf("  Download cfg: chunk_span=%s parallel=%d force=%t full=%t\n",
+		labelStyle.Render(formatInt64Exact(chunkIDSpan)),
+		parallel,
+		force,
+		full,
+	)
+	if fromID > 0 || toID > 0 {
+		fmt.Printf("  Requested range: %s\n", labelStyle.Render(formatHNRange(fromID, toID)))
+	}
 
-	var clickhouseRes *hn.ClickHouseDownloadResult
-	var apiRes *hn.APIDownloadResult
-	var apiDeltaFrom, apiDeltaTo int64
-	var apiWasDelta bool
-	apiDownloaded := false
-
-	doClickHouse := func() error {
-		fmt.Println(infoStyle.Render("Downloading HN data from ClickHouse SQL playground (chunked Parquet)..."))
-		cb := func(p hn.ClickHouseDownloadProgress) {
+	printCHProgress := func(prefix string) func(hn.ClickHouseDownloadProgress) {
+		return func(p hn.ClickHouseDownloadProgress) {
 			if p.Complete {
 				fmt.Printf("  %s  chunks=%d/%d (skipped=%d) bytes=%s avg=%s elapsed=%s\n",
-					successStyle.Render("OK"),
-					p.ChunksDone, p.ChunksTotal, p.ChunksSkipped,
-					formatBytes(p.BytesDone),
-					formatBytesPerSec(p.OverallSpeedBPS),
-					formatDuration(p.Elapsed),
-				)
+					successStyle.Render("OK"), p.ChunksDone, p.ChunksTotal, p.ChunksSkipped,
+					formatBytes(p.BytesDone), formatBytesPerSec(p.OverallSpeedBPS), formatDuration(p.Elapsed))
 				return
 			}
 			if p.Detail != "" {
-				fmt.Printf("  Chunk %d/%d [%d-%d] %s (%s) active=%d total=%s avg=%s\n",
-					p.ChunksDone, p.ChunksTotal, p.ChunkStart, p.ChunkEnd, p.Detail,
-					formatBytes(p.ChunkBytes),
-					p.ChunksActive,
-					formatBytes(p.BytesDone),
-					formatBytesPerSec(p.OverallSpeedBPS),
-				)
+				fmt.Printf("  %s chunk %d/%d [%d-%d] %s (%s) active=%d total=%s avg=%s\n",
+					prefix, p.ChunksDone, p.ChunksTotal, p.ChunkStart, p.ChunkEnd, p.Detail,
+					formatBytes(p.ChunkBytes), p.ChunksActive, formatBytes(p.BytesDone), formatBytesPerSec(p.OverallSpeedBPS))
 				return
 			}
-			fmt.Printf("  Chunk %d/%d [%d-%d] %s in %s (%s) active=%d total=%s avg=%s\n",
-				p.ChunksDone, p.ChunksTotal, p.ChunkStart, p.ChunkEnd,
-				formatBytes(p.ChunkBytes),
-				formatDuration(p.ChunkElapsed),
-				formatBytesPerSec(p.ChunkSpeedBPS),
-				p.ChunksActive,
-				formatBytes(p.BytesDone),
-				formatBytesPerSec(p.OverallSpeedBPS),
-			)
+			fmt.Printf("  %s chunk %d/%d [%d-%d] %s in %s (%s) active=%d total=%s avg=%s\n",
+				prefix, p.ChunksDone, p.ChunksTotal, p.ChunkStart, p.ChunkEnd,
+				formatBytes(p.ChunkBytes), formatDuration(p.ChunkElapsed), formatBytesPerSec(p.ChunkSpeedBPS),
+				p.ChunksActive, formatBytes(p.BytesDone), formatBytesPerSec(p.OverallSpeedBPS))
 		}
+	}
+	printCHResult := func(label string, res *hn.ClickHouseDownloadResult) {
+		if res == nil {
+			return
+		}
+		fmt.Printf("  %s dir:     %s\n", label, labelStyle.Render(res.Dir))
+		fmt.Printf("  %s range:   %s\n", label, labelStyle.Render(formatHNRange(res.StartID, res.EndID)))
+		if res.RemoteInfo != nil {
+			fmt.Printf("  Remote rows: %s (%s) max_id=%s (%s) max_time=%s\n",
+				successStyle.Render(formatLargeNumber(res.RemoteInfo.Count)),
+				successStyle.Render(formatInt64Exact(res.RemoteInfo.Count)),
+				successStyle.Render(formatLargeNumber(res.RemoteInfo.MaxID)),
+				successStyle.Render(formatInt64Exact(res.RemoteInfo.MaxID)),
+				labelStyle.Render(res.RemoteInfo.MaxTime))
+		}
+	}
+
+	var baseRes, deltaRes *hn.ClickHouseDownloadResult
+	localSt, _ := cfg.LocalStatus(ctx)
+	hasBase := localSt != nil && localSt.CHParquetCount > 0
+
+	if full || !hasBase {
+		fmt.Println(infoStyle.Render("Downloading HN base parquet chunks from ClickHouse..."))
 		res, err := cfg.DownloadClickHouseParquet(ctx, hn.ClickHouseDownloadOptions{
-			FromID:      fromID,
+			FromID:      ternary(fromID > 0, fromID, int64(1)),
 			ToID:        toID,
 			ChunkIDSpan: chunkIDSpan,
 			Parallelism: parallel,
-			Force:       force,
-		}, cb)
+			Force:       force || full,
+		}, printCHProgress("base"))
 		if err != nil {
-			return err
+			return "", err
 		}
-		clickhouseRes = res
-		fmt.Printf("  Dir:        %s\n", labelStyle.Render(res.Dir))
-		fmt.Printf("  Range:      %d-%d\n", res.StartID, res.EndID)
-		if res.RemoteInfo != nil {
-			fmt.Printf("  Remote rows: %s  max_id=%s  max_time=%s\n",
-				successStyle.Render(formatLargeNumber(res.RemoteInfo.Count)),
-				successStyle.Render(formatLargeNumber(res.RemoteInfo.MaxID)),
-				labelStyle.Render(res.RemoteInfo.MaxTime),
-			)
-		}
-		return nil
-	}
-
-	doParquet := func() error {
-		fmt.Println(infoStyle.Render("Downloading HN parquet snapshot..."))
-		var lastLineLen int
-		cb := func(p hn.ParquetDownloadProgress) {
-			if p.Complete && p.Skipped {
-				line := fmt.Sprintf("  %s  already complete (%s)", successStyle.Render("OK"), formatBytes(p.LocalSize))
-				fmt.Println(line)
-				return
-			}
-			if p.Complete {
-				line := fmt.Sprintf("  %s  %s downloaded (%s total)", successStyle.Render("OK"), filepath.Base(p.Path), formatBytes(p.LocalSize))
-				fmt.Printf("\r%s%s\n", line, padSpaces(lastLineLen-len(line)))
-				lastLineLen = 0
-				return
-			}
-			pct := 0.0
-			if p.RemoteSize > 0 {
-				pct = 100 * float64(p.LocalSize) / float64(p.RemoteSize)
-			}
-			line := fmt.Sprintf("  %.1f%%  %s / %s  %s",
-				pct,
-				formatBytes(p.LocalSize),
-				formatBytes(p.RemoteSize),
-				formatBytesPerSec(p.SpeedBPS),
-			)
-			fmt.Printf("\r%s%s", line, padSpaces(lastLineLen-len(line)))
-			lastLineLen = len(line)
-		}
-		res, err := cfg.DownloadParquet(ctx, force, cb)
-		if lastLineLen > 0 {
-			fmt.Println()
-		}
+		baseRes = res
+		printCHResult("Base", res)
+	} else {
+		deltaFrom, hw, err := cfg.SuggestClickHouseDeltaStartID(ctx, fromID, dbPath)
 		if err != nil {
-			return err
+			return "", fmt.Errorf("suggest clickhouse delta start id: %w", err)
 		}
-		fmt.Printf("  Path:       %s\n", labelStyle.Render(res.Path))
-		fmt.Printf("  Size:       %s\n", successStyle.Render(formatBytes(res.LocalSize)))
-		if res.Remote != nil && res.Remote.ETag != "" {
-			fmt.Printf("  ETag:       %s\n", labelStyle.Render(res.Remote.ETag))
-		}
-		return nil
-	}
-
-	doAPI := func() error {
-		fmt.Println(infoStyle.Render("Downloading HN data from official API (fallback mode)..."))
-		cb := func(p hn.APIDownloadProgress) {
-			if p.Complete {
-				fmt.Printf("  %s  chunks=%d (skipped=%d) ids=%d items=%d\n",
-					successStyle.Render("OK"), p.ChunksDone, p.ChunksSkipped, p.IDsProcessed, p.ItemsWritten)
-				return
-			}
-			if p.Detail != "" {
-				fmt.Printf("  Chunk %d/%d [%d-%d] %s\n", p.ChunksDone, p.ChunksTotal, p.ChunkStart, p.ChunkEnd, p.Detail)
-				return
-			}
-			fmt.Printf("  Chunk %d/%d [%d-%d] ids=%d items=%d\n",
-				p.ChunksDone, p.ChunksTotal, p.ChunkStart, p.ChunkEnd, p.IDsProcessed, p.ItemsWritten)
-		}
-		res, err := cfg.DownloadAPI(ctx, hn.APIDownloadOptions{
-			Workers:   workers,
-			ChunkSize: chunkSize,
-			FromID:    fromID,
-			ToID:      toID,
-			Force:     force,
-		}, cb)
+		remote, err := cfg.ClickHouseInfo(ctx)
 		if err != nil {
-			return err
-		}
-		apiDownloaded = true
-		apiRes = res
-		apiWasDelta = false
-		apiDeltaFrom, apiDeltaTo = 0, 0
-		fmt.Printf("  Dir:        %s\n", labelStyle.Render(res.Dir))
-		fmt.Printf("  Range:      %d-%d\n", res.StartID, res.EndID)
-		return nil
-	}
-
-	doAPIDelta := func() error {
-		if noDelta {
-			return nil
-		}
-		if clickhouseRes == nil {
-			return nil
-		}
-		maxItem, err := cfg.GetMaxItem(ctx)
-		if err != nil {
-			return fmt.Errorf("get HN maxitem for delta: %w", err)
-		}
-		deltaFrom := clickhouseRes.EndID + 1
-		if deltaFrom <= 0 {
-			deltaFrom = clickhouseRes.RemoteMaxID + 1
-		}
-		if deltaFrom > maxItem {
-			fmt.Println(labelStyle.Render("No API delta needed (ClickHouse is already at or ahead of HN maxitem)."))
-			return nil
-		}
-		fmt.Println(infoStyle.Render(fmt.Sprintf("Downloading API delta %d-%d to catch up after ClickHouse snapshot...", deltaFrom, maxItem)))
-		cb := func(p hn.APIDownloadProgress) {
-			if p.Complete {
-				fmt.Printf("  %s  delta chunks=%d (skipped=%d) ids=%d items=%d\n",
-					successStyle.Render("OK"), p.ChunksDone, p.ChunksSkipped, p.IDsProcessed, p.ItemsWritten)
-				return
-			}
-		}
-		res, err := cfg.DownloadAPI(ctx, hn.APIDownloadOptions{
-			Workers:   workers,
-			ChunkSize: chunkSize,
-			FromID:    deltaFrom,
-			ToID:      maxItem,
-			Force:     false, // preserve resumability for delta chunks
-		}, cb)
-		if err != nil {
-			return err
-		}
-		apiDownloaded = true
-		apiRes = res
-		apiWasDelta = true
-		apiDeltaFrom, apiDeltaTo = deltaFrom, maxItem
-		return nil
-	}
-
-	finalize := func(sourceUsed string) (string, error) {
-		st := &hn.DownloadState{
-			SourceUsed: sourceUsed,
-		}
-		if clickhouseRes != nil {
-			st.ClickHouse = &hn.ClickHouseRunState{
-				StartID:           clickhouseRes.StartID,
-				EndID:             clickhouseRes.EndID,
-				RemoteMaxID:       clickhouseRes.RemoteMaxID,
-				RemoteCount:       clickhouseRes.RemoteCount,
-				ChunkIDSpan:       clickhouseRes.ChunkIDSpan,
-				TailRefreshChunks: clickhouseRes.TailRefreshed,
-				IncrementalFromID: clickhouseRes.IncrementalFromID,
-			}
-		}
-		if apiRes != nil {
-			st.API = &hn.APIRunState{
-				StartID: apiRes.StartID,
-				EndID:   apiRes.EndID,
-				MaxItem: apiRes.MaxItem,
-				IsDelta: apiWasDelta || (apiDeltaFrom > 0 && apiDeltaTo > 0),
-			}
-		}
-		if err := cfg.WriteDownloadState(st); err != nil {
-			fmt.Printf("  %s unable to write download state: %v\n", warningStyle.Render("WARN"), err)
-		}
-		return sourceUsed, nil
-	}
-
-	doDelta := func() error {
-		dbPath, _ := cmd.Flags().GetString("db")
-		deltaFrom, hw, err := cfg.SuggestAPIDeltaStartID(ctx, fromID, dbPath)
-		if err != nil {
-			return fmt.Errorf("suggest local delta start id: %w", err)
-		}
-		maxItem, err := cfg.GetMaxItem(ctx)
-		if err != nil {
-			return fmt.Errorf("get HN maxitem for delta: %w", err)
-		}
-		deltaTo := toID
-		if deltaTo <= 0 || deltaTo > maxItem {
-			deltaTo = maxItem
+			return "", err
 		}
 		if hw != nil {
-			fmt.Printf("  Local high-water mark: %s (db=%s ch=%s api=%s state=%s)\n",
+			fmt.Printf("  Local high-water mark: %s (db=%s base=%s delta=%s state=%s)\n",
 				labelStyle.Render(formatInt64Exact(hw.MaxKnownID)),
 				labelStyle.Render(formatInt64Exact(hw.FromDB)),
 				labelStyle.Render(formatInt64Exact(hw.FromCHChunks)),
-				labelStyle.Render(formatInt64Exact(hw.FromAPIChunks)),
-				labelStyle.Render(formatInt64Exact(hw.FromDownloadState)),
-			)
+				labelStyle.Render(formatInt64Exact(hw.FromCHDelta)),
+				labelStyle.Render(formatInt64Exact(hw.FromDownloadState)))
+		}
+		deltaTo := toID
+		if deltaTo <= 0 || deltaTo > remote.MaxID {
+			deltaTo = remote.MaxID
 		}
 		if deltaFrom > deltaTo {
-			fmt.Printf("  %s  no new API delta (local max=%s, remote maxitem=%s)\n",
+			fmt.Printf("  %s  no new ClickHouse delta (local max=%s, remote max=%s)\n",
 				successStyle.Render("OK"),
 				labelStyle.Render(formatInt64Exact(deltaFrom-1)),
-				labelStyle.Render(formatInt64Exact(deltaTo)),
-			)
-			apiDownloaded = false
-			apiWasDelta = true
-			apiRes = &hn.APIDownloadResult{
-				Dir:     cfg.APIChunksDir(),
-				StartID: deltaFrom,
-				EndID:   deltaTo,
-				MaxItem: maxItem,
+				labelStyle.Render(formatInt64Exact(deltaTo)))
+			deltaRes = &hn.ClickHouseDownloadResult{Dir: cfg.ClickHouseDeltaParquetDir(), StartID: deltaFrom, EndID: deltaTo, RemoteMaxID: remote.MaxID, RemoteCount: remote.Count, ChunkIDSpan: chunkIDSpan, IncrementalFromID: deltaFrom, RemoteInfo: remote}
+		} else {
+			fmt.Println(infoStyle.Render("Downloading HN delta parquet chunks from ClickHouse (checkpoint-aligned)..."))
+			res, err := cfg.DownloadClickHouseParquet(ctx, hn.ClickHouseDownloadOptions{
+				FromID:            deltaFrom,
+				ToID:              deltaTo,
+				ChunkIDSpan:       chunkIDSpan,
+				Parallelism:       parallel,
+				RefreshTailChunks: 0,
+				OutputDir:         cfg.ClickHouseDeltaParquetDir(),
+				AlignCheckpoints:  true,
+				Force:             force,
+			}, printCHProgress("delta"))
+			if err != nil {
+				return "", err
 			}
-			apiDeltaFrom, apiDeltaTo = deltaFrom, deltaTo
-			return nil
+			deltaRes = res
+			printCHResult("Delta", res)
 		}
-		fmt.Println(infoStyle.Render(fmt.Sprintf("Downloading HN API delta %d-%d...", deltaFrom, deltaTo)))
-		cb := func(p hn.APIDownloadProgress) {
-			if p.Complete {
-				fmt.Printf("  %s  delta chunks=%d (skipped=%d) ids=%d items=%d\n",
-					successStyle.Render("OK"), p.ChunksDone, p.ChunksSkipped, p.IDsProcessed, p.ItemsWritten)
-				return
-			}
-		}
-		res, err := cfg.DownloadAPI(ctx, hn.APIDownloadOptions{
-			Workers:   workers,
-			ChunkSize: chunkSize,
-			FromID:    deltaFrom,
-			ToID:      deltaTo,
-			Force:     false,
-		}, cb)
-		if err != nil {
-			return err
-		}
-		apiDownloaded = true
-		apiRes = res
-		apiWasDelta = true
-		apiDeltaFrom, apiDeltaTo = deltaFrom, deltaTo
-		fmt.Printf("  Dir:        %s\n", labelStyle.Render(res.Dir))
-		fmt.Printf("  Range:      %s-%s\n", labelStyle.Render(formatInt64Exact(res.StartID)), labelStyle.Render(formatInt64Exact(res.EndID)))
-		return nil
 	}
 
-	switch source {
-	case "clickhouse":
-		if err := doClickHouse(); err != nil {
-			return "", err
-		}
-		if err := doAPIDelta(); err != nil {
-			return "", err
-		}
-		if apiDownloaded {
-			return finalize("hybrid")
-		}
-		return finalize("clickhouse")
-	case "parquet":
-		if err := doParquet(); err != nil {
-			return "", err
-		}
-		return finalize("parquet")
-	case "api":
-		if err := doAPI(); err != nil {
-			return "", err
-		}
-		return finalize("api")
-	case "delta":
-		if err := doDelta(); err != nil {
-			return "", err
-		}
-		if st, err := cfg.LocalStatus(ctx); err == nil && st.CHParquetCount > 0 {
-			return finalize("hybrid")
-		}
-		return finalize("api")
-	case "auto":
-		err := doClickHouse()
-		if err == nil {
-			if derr := doAPIDelta(); derr != nil {
-				return "", derr
-			}
-			if apiDownloaded {
-				return finalize("hybrid")
-			}
-			return finalize("clickhouse")
-		}
-		if noFallback {
-			return "", err
-		}
-		fmt.Printf("%s clickhouse download failed: %v\n", warningStyle.Render("WARN"), err)
-		fmt.Println(labelStyle.Render("Falling back to official Hacker News API."))
-		if apiErr := doAPI(); apiErr != nil {
-			return "", errors.Join(err, apiErr)
-		}
-		return finalize("api")
-	default:
-		return "", fmt.Errorf("invalid source %q", source)
+	state := &hn.DownloadState{SourceUsed: "clickhouse"}
+	if baseRes != nil {
+		state.ClickHouse = &hn.ClickHouseRunState{StartID: baseRes.StartID, EndID: baseRes.EndID, RemoteMaxID: baseRes.RemoteMaxID, RemoteCount: baseRes.RemoteCount, ChunkIDSpan: baseRes.ChunkIDSpan, TailRefreshChunks: baseRes.TailRefreshed, IncrementalFromID: baseRes.IncrementalFromID}
 	}
+	if deltaRes != nil {
+		state.Delta = &hn.ClickHouseRunState{StartID: deltaRes.StartID, EndID: deltaRes.EndID, RemoteMaxID: deltaRes.RemoteMaxID, RemoteCount: deltaRes.RemoteCount, ChunkIDSpan: deltaRes.ChunkIDSpan, TailRefreshChunks: deltaRes.TailRefreshed, IncrementalFromID: deltaRes.IncrementalFromID}
+	}
+	if err := cfg.WriteDownloadState(state); err != nil {
+		fmt.Printf("  %s unable to write download state: %v\n", warningStyle.Render("WARN"), err)
+	}
+	finalSt, _ := cfg.LocalStatus(ctx)
+	if finalSt != nil && finalSt.CHParquetCount > 0 && finalSt.CHDeltaCount > 0 {
+		return "hybrid", nil
+	}
+	return "clickhouse", nil
 }
 
 func parseHNImportSource(s string) (hn.ImportSource, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "auto":
 		return hn.ImportSourceAuto, nil
-	case "parquet":
-		return hn.ImportSourceParquet, nil
 	case "clickhouse":
 		return hn.ImportSourceClickHouse, nil
 	case "hybrid":
 		return hn.ImportSourceHybrid, nil
-	case "api":
-		return hn.ImportSourceAPI, nil
 	default:
-		return "", fmt.Errorf("invalid --source %q (want auto|clickhouse|hybrid|parquet|api)", s)
+		return "", fmt.Errorf("invalid --source %q (want auto|clickhouse|hybrid)", s)
 	}
 }
 
