@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-mizu/mizu/blueprints/search/pkg/cc"
@@ -1626,6 +1627,31 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 	return err
 }
 
+// v3ProgressWriter wraps a ResultWriter and FailureWriter to count outcomes for live display.
+type v3ProgressWriter struct {
+	inner   recrawl_v3.ResultWriter
+	total   int64 // atomic
+	ok      int64 // atomic
+	failed  int64 // atomic
+	timeout int64 // atomic
+}
+
+func (p *v3ProgressWriter) Add(r recrawler.Result) {
+	p.inner.Add(r)
+	atomic.AddInt64(&p.total, 1)
+	switch {
+	case r.Error == "":
+		atomic.AddInt64(&p.ok, 1)
+	case strings.Contains(r.Error, "timeout") || strings.Contains(r.Error, "deadline"):
+		atomic.AddInt64(&p.timeout, 1)
+	default:
+		atomic.AddInt64(&p.failed, 1)
+	}
+}
+
+func (p *v3ProgressWriter) Flush(ctx context.Context) error { return p.inner.Flush(ctx) }
+func (p *v3ProgressWriter) Close() error                    { return p.inner.Close() }
+
 // runCCRecrawlV3 delegates crawling to a recrawl_v3 engine selected by opts.engine.
 // It is called from runCCRecrawl when --engine is set. failedDBPath dir must already exist.
 func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
@@ -1674,10 +1700,70 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 
 	fmt.Println(successStyle.Render(fmt.Sprintf("  FailedDB → %s", failedDBPath)))
 	fmt.Println(successStyle.Render(fmt.Sprintf("  Results  → %s/ (16 shards)", resultDir)))
+	fmt.Println()
+
+	// Progress wrapper counts outcomes as results arrive.
+	pw := &v3ProgressWriter{inner: &recrawl_v3.ResultDBWriter{DB: rdb}}
+
+	// Live progress goroutine: prints a single updating line every 500ms.
+	progressCtx, cancelProgress := context.WithCancel(ctx)
+	defer cancelProgress()
+	progressDone := make(chan struct{})
+	start := time.Now()
+	seedTotal := int64(len(seeds))
+	go func() {
+		defer close(progressDone)
+		ticker := time.NewTicker(500 * time.Millisecond)
+		defer ticker.Stop()
+		var lastTotal int64
+		var lastT time.Time
+		for {
+			select {
+			case <-progressCtx.Done():
+				return
+			case t := <-ticker.C:
+				tot := atomic.LoadInt64(&pw.total)
+				ok := atomic.LoadInt64(&pw.ok)
+				fail := atomic.LoadInt64(&pw.failed)
+				tout := atomic.LoadInt64(&pw.timeout)
+				elapsed := time.Since(start)
+
+				// Rolling RPS over last 500ms window
+				dt := t.Sub(lastT).Seconds()
+				rollingRPS := 0.0
+				if dt > 0 {
+					rollingRPS = float64(tot-lastTotal) / dt
+				}
+				lastTotal = tot
+				lastT = t
+
+				pct := 0.0
+				if seedTotal > 0 {
+					pct = float64(tot) / float64(seedTotal) * 100
+				}
+				eta := ""
+				if rollingRPS > 0 && seedTotal > tot {
+					etaDur := time.Duration(float64(seedTotal-tot)/rollingRPS) * time.Second
+					eta = fmt.Sprintf("  ETA %s", etaDur.Truncate(time.Second))
+				}
+				fmt.Printf("\r  %s  %d/%d (%.0f%%)  ok=%d fail=%d tout=%d  %.0f rps%s",
+					elapsed.Truncate(time.Second),
+					tot, seedTotal, pct,
+					ok, fail, tout,
+					rollingRPS,
+					eta,
+				)
+			}
+		}
+	}()
 
 	stats, err := eng.Run(ctx, seeds, dnsCache, cfg,
-		&recrawl_v3.ResultDBWriter{DB: rdb},
+		pw,
 		&recrawl_v3.FailedDBWriter{DB: failedDB})
+	cancelProgress()
+	<-progressDone
+	fmt.Println() // newline after progress line
+
 	if err != nil {
 		return fmt.Errorf("engine run: %w", err)
 	}

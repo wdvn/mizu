@@ -104,7 +104,7 @@ build-linux: ## Build Ubuntu/Linux binary to $$HOME/bin/search-linux (Docker, CG
 			--target artifact \
 			-t "$$img" \
 			"$(LINUX_BUILD_CONTEXT)"; \
-		cid="$$($(LINUX_CONTAINER) create "$$img")"; \
+		cid="$$($(LINUX_CONTAINER) create --platform "linux/$(LINUX_GOARCH)" "$$img")"; \
 		$(LINUX_CONTAINER) cp "$$cid:/search-linux" "$$tmp_out/search-linux"; \
 		install -m 0755 "$$tmp_out/search-linux" "$(LINUX_BINARY)"
 	@echo "Built Linux binary: $(LINUX_BINARY) ($(VERSION))"
