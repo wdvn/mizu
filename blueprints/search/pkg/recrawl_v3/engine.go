@@ -43,7 +43,18 @@ type Config struct {
 	InsecureTLS         bool   // skip TLS verification
 	DroneCount          int    // swarm engine: number of drone processes (engine C)
 	SearchBinary        string // path to self binary (engine C drones re-exec it)
-	DomainFailThreshold int    // consecutive timeouts before abandoning a domain (0=disabled)
+	DomainFailThreshold int           // consecutive timeouts before abandoning a domain (0=disabled)
+	DomainTimeout       time.Duration // per-domain context deadline; cancel remaining URLs after this (0=disabled)
+	Notifier            DomainNotifier // optional domain lifecycle callbacks (nil = disabled)
+}
+
+// DomainNotifier receives domain lifecycle events from the engine.
+// All methods are nil-safe to call — engines check cfg.Notifier != nil first.
+type DomainNotifier interface {
+	// StartDomain is called when the engine begins processing a domain's URLs.
+	StartDomain(domain string, urlCount int)
+	// EndDomain is called when all URLs for a domain have been processed or abandoned.
+	EndDomain(domain string)
 }
 
 // DefaultConfig returns sensible defaults for the remote server.

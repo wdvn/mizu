@@ -353,6 +353,38 @@ Notes:
 3. **Epoll** (fixed goroutine pool) needs a much higher goroutine count (e.g., 16× latency/workers) to be competitive; the 4×nCPU default is tuned for CPU-bound work, not I/O-bound networking.
 4. **v3 vs v1/v2**: v3 processes 10K URLs in 27s; v1/v2 needs 120s+ (4-5× slower) — but v1/v2 downloads full bodies, adding download time.
 
+### HN Dataset Benchmarks (100K URLs, status-only, keepalive engine)
+
+Server: 4× AMD EPYC, 1.5 GB RAM, fd limit = 65536
+Dataset: 100K seeds → 87K after DNS filtering (13K NXDOMAIN/DNS-timeout removed)
+DNS cache: 153K live, 38K dead, 5.8K timeout; 25.7K unique domains, avg 3.4 URLs/domain
+
+| Workers | Timeout | Domain Fail Threshold | Avg RPS | Peak RPS | Time | OK Rate | Notes |
+|---------|---------|----------------------|---------|----------|------|---------|-------|
+| 3000 | 5s | 3 rounds (default) | **1903** | 4004 | 44s | **68.5%** | Best balance |
+| 3000 | 5s | domain-timeout=20s | 1807 | 3340 | 47s | 69.9% | Slightly more OK, slower |
+| 3000 | 3s | 3 rounds | 2113 | 4157 | 40s | 44.8% | Faster but loses 3-5s responders |
+| 3000 | 2s | 3 rounds | 2931 | **5942** | 28s | 21.7% | Peak >5000 but 76% timeout |
+| 4000 | 5s | 3 rounds | 1641 | 3789 | 52s | 57.9% | Worse than 3000w (rate-limiting) |
+| 5000 | 5s | 3 rounds | 1878 | **5791** | 45s | 47% | Peak >5000 but 49% timeout |
+| 3000 | 3s | 1 round | 2601 | 4491 | 30s | 47% | Aggressive abandon, fewer skips |
+
+#### Key Findings (HN Dataset)
+
+1. **Sweet spot is 3000 workers at 5s timeout**: avg 1903 rps, 68.5% OK rate, 44s for 87K URLs.
+2. **Peak 5000+** is achievable: `--workers 5000` gives 5791 peak, `--timeout 2000` gives 5942 peak, but both come with high timeout rates (47-76%).
+3. **4000 workers is worse than 3000**: servers start rate-limiting (429) at higher concurrency, reducing OK rate from 68.5% to 57.9%.
+4. **Domain-timeout=20s** helps cut tail domains (ones taking >20s) but adds some overhead; modest improvement.
+5. **Fundamental limit**: the dataset has ~27.5% inherent HTTP timeout rate. With 3000 workers and 5s timeout, theoretical avg ceiling ≈ 3000/2.46s = ~1220 rps steady-state; the observed 1903 is higher due to burst throughput early in the run. True 5000+ avg rps is not achievable with this dataset without either a different URL set or much lower timeout duration (accepting more timeouts).
+
+#### Performance Improvements vs v1/v2
+
+| Engine | Time for 87K HN URLs | OK Rate |
+|--------|---------------------|---------|
+| v1/v2 (legacy) | ~6 min (est.) | ~65% |
+| v3 keepalive (3000w) | **44s** | 68.5% |
+| **Speedup** | **~8×** | same |
+
 ### Critical Bug Fixed During Benchmarking
 
 **RawHTTP TLS hang bug**: `net.DialContext` does NOT preserve its context deadline on the returned `net.Conn`. Without explicitly calling `rawConn.SetDeadline(time.Now().Add(cfg.Timeout))` before `tls.Handshake()`, workers block indefinitely on slow TLS servers. Fix: set deadline on raw conn before wrapping with `tls.Client()`.

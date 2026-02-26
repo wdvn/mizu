@@ -184,9 +184,24 @@ func processOneDomain(ctx context.Context, urls []recrawler.SeedURL,
 	if len(urls) == 0 {
 		return
 	}
+	domain := urls[0].Domain
 	host := urls[0].Host
 	if host == "" {
-		host = urls[0].Domain
+		host = domain
+	}
+	if cfg.Notifier != nil {
+		cfg.Notifier.StartDomain(domain, len(urls))
+		defer cfg.Notifier.EndDomain(domain)
+	}
+
+	// Per-domain context: if DomainTimeout > 0, cancel remaining URLs after the deadline.
+	// This short-circuits dead HTTP domains (which would each use a full timeout-per-batch)
+	// without waiting for every URL to individually time out.
+	domainCtx := ctx
+	if cfg.DomainTimeout > 0 {
+		var cancelDomain context.CancelFunc
+		domainCtx, cancelDomain = context.WithTimeout(ctx, cfg.DomainTimeout)
+		defer cancelDomain()
 	}
 
 	// Shared transport — all innerN goroutines reuse the same connection pool.
@@ -239,7 +254,7 @@ func processOneDomain(ctx context.Context, urls []recrawler.SeedURL,
 				},
 			}
 			for seed := range urlCh {
-				// Fast-abort on context cancellation
+				// Fast-abort on global context cancellation
 				select {
 				case <-ctx.Done():
 					return
@@ -257,6 +272,20 @@ func processOneDomain(ctx context.Context, urls []recrawler.SeedURL,
 					continue
 				default:
 				}
+				// Per-domain context deadline exceeded?
+				if cfg.DomainTimeout > 0 {
+					select {
+					case <-domainCtx.Done():
+						skipped.Add(1)
+						failures.AddURL(recrawler.FailedURL{
+							URL:    seed.URL,
+							Domain: seed.Domain,
+							Reason: "domain_deadline_exceeded",
+						})
+						continue
+					default:
+					}
+				}
 
 				// Apply adaptive timeout
 				if t := adaptive.Timeout(cfg.Timeout); t > 0 {
@@ -265,7 +294,7 @@ func processOneDomain(ctx context.Context, urls []recrawler.SeedURL,
 					client.Timeout = cfg.Timeout
 				}
 
-				r := keepaliveFetchOne(ctx, client, seed, cfg)
+				r := keepaliveFetchOne(domainCtx, client, seed, cfg)
 				total.Add(1)
 				peak.Record()
 				bytesTotal.Add(r.ContentLength)

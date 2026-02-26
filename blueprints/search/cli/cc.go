@@ -1652,12 +1652,36 @@ type v3LiveStats struct {
 	latBuckets [8]atomic.Int64
 	latTotal   atomic.Int64
 
+	// Per-domain tracking (implements recrawl_v3.DomainNotifier)
+	activeDomains sync.Map     // domain → *v3DomainInfo
+	totalDomains  atomic.Int64 // domains entered via StartDomain
+	doneDomains   atomic.Int64 // domains exited via EndDomain
+	slowDomainMs  int64        // show domain as "slow" if active for > this ms (0=disabled)
+
 	// Rolling speed (10-second window), protected by speedMu
 	speedMu    sync.Mutex
 	speedTicks []v3SpeedTick
 	peakRPS    float64
 	rollingRPS float64
 	rollingBW  float64
+}
+
+// v3DomainInfo holds per-domain state for the slow-domain display.
+type v3DomainInfo struct {
+	start time.Time
+	total int
+}
+
+// StartDomain implements recrawl_v3.DomainNotifier.
+func (ls *v3LiveStats) StartDomain(domain string, urlCount int) {
+	ls.totalDomains.Add(1)
+	ls.activeDomains.Store(domain, &v3DomainInfo{start: time.Now(), total: urlCount})
+}
+
+// EndDomain implements recrawl_v3.DomainNotifier.
+func (ls *v3LiveStats) EndDomain(domain string) {
+	ls.activeDomains.Delete(domain)
+	ls.doneDomains.Add(1)
 }
 
 func (ls *v3LiveStats) recordResult(r recrawler.Result) {
@@ -1835,7 +1859,8 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	fmt.Printf("  FailedDB          %s\n", failedDBPath)
 	fmt.Printf("  Results           %s/ (16 shards)\n\n", resultDir)
 
-	ls := &v3LiveStats{}
+	ls := &v3LiveStats{slowDomainMs: 30_000}
+	cfg.Notifier = ls
 	pw := &v3ProgressWriter{
 		inner: &recrawl_v3.ResultDBWriter{DB: rdb},
 		ls:    ls,
@@ -2008,6 +2033,42 @@ func v3RenderProgress(ls *v3LiveStats, cfg recrawl_v3.Config, engineName string,
 	if skip > 0 {
 		sb.WriteString(fmt.Sprintf("  ⌛ %s domain-killed (%4.1f%%)\n",
 			ccFmtInt64(skip), v3SafePct(skip, done)))
+	}
+	// Domain progress (only shown when DomainNotifier is active)
+	if totDom := ls.totalDomains.Load(); totDom > 0 {
+		doneDom := ls.doneDomains.Load()
+		activeDom := totDom - doneDom
+		sb.WriteString(fmt.Sprintf("  Domains   total=%s  done=%s  active=%s\n",
+			ccFmtInt64(totDom), ccFmtInt64(doneDom), ccFmtInt64(activeDom)))
+		if ls.slowDomainMs > 0 {
+			now := time.Now()
+			threshold := time.Duration(ls.slowDomainMs) * time.Millisecond
+			type slowEntry struct {
+				domain  string
+				elapsed time.Duration
+				total   int
+			}
+			var slow []slowEntry
+			ls.activeDomains.Range(func(key, val any) bool {
+				if info, ok := val.(*v3DomainInfo); ok {
+					if el := now.Sub(info.start); el >= threshold {
+						slow = append(slow, slowEntry{key.(string), el, info.total})
+					}
+				}
+				return true
+			})
+			sort.Slice(slow, func(i, j int) bool { return slow[i].elapsed > slow[j].elapsed })
+			if len(slow) > 3 {
+				slow = slow[:3]
+			}
+			if len(slow) > 0 {
+				var parts []string
+				for _, s := range slow {
+					parts = append(parts, fmt.Sprintf("%s (%s, %d urls)", s.domain, v3FmtDur(s.elapsed), s.total))
+				}
+				sb.WriteString(fmt.Sprintf("  Slow      %s\n", strings.Join(parts, "  │  ")))
+			}
+		}
 	}
 	if statusStr != "" {
 		sb.WriteString(fmt.Sprintf("  HTTP  %s\n", statusStr))

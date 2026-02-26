@@ -16,6 +16,7 @@ type RecrawlSeedOptions struct {
 	DomainsDBPath string
 	OutDBPath     string
 	Limit         int
+	MaxPerDomain  int    // max URLs per domain (0=no limit); uses ROW_NUMBER() window for even sampling
 	DomainLike    string
 	Force         bool
 	Progress      func(RecrawlSeedProgress)
@@ -107,7 +108,29 @@ func (c Config) BuildRecrawlSeedDB(ctx context.Context, opts RecrawlSeedOptions)
 	}
 
 	// docs schema matches recrawler.LoadSeedStats/LoadSeedURLs expectations.
-	createSQL := fmt.Sprintf(`CREATE OR REPLACE TABLE docs AS
+	// When MaxPerDomain > 0, use ROW_NUMBER() window function for even sampling across domains.
+	var createSQL string
+	if opts.MaxPerDomain > 0 {
+		createSQL = fmt.Sprintf(`CREATE OR REPLACE TABLE docs AS
+SELECT url, domain, protocol, content_type, tld, item_id, item_time_ts
+FROM (
+  SELECT
+    CAST(url AS VARCHAR) AS url,
+    lower(CAST(host AS VARCHAR)) AS domain,
+    lower(COALESCE(CAST(scheme AS VARCHAR), regexp_extract(CAST(url AS VARCHAR), '^([a-zA-Z][a-zA-Z0-9+.-]*):', 1))) AS protocol,
+    CAST(NULL AS VARCHAR) AS content_type,
+    lower(regexp_extract(CAST(host AS VARCHAR), '([^.]+)$', 1)) AS tld,
+    CAST(item_id AS BIGINT) AS item_id,
+    CAST(item_time_ts AS TIMESTAMP) AS item_time_ts,
+    ROW_NUMBER() OVER (PARTITION BY lower(host) ORDER BY item_time_ts DESC NULLS LAST, item_id DESC) AS rn
+  FROM src_hn_domains.pages
+  WHERE %s
+) sub
+WHERE rn <= %d
+ORDER BY domain, item_time_ts DESC NULLS LAST
+%s`, whereSQL, opts.MaxPerDomain, limitSQL)
+	} else {
+		createSQL = fmt.Sprintf(`CREATE OR REPLACE TABLE docs AS
 SELECT
   CAST(url AS VARCHAR) AS url,
   lower(CAST(host AS VARCHAR)) AS domain,
@@ -120,6 +143,7 @@ FROM src_hn_domains.pages
 WHERE %s
 ORDER BY item_time_ts DESC NULLS LAST, item_id DESC
 %s`, whereSQL, limitSQL)
+	}
 	if _, err := db.ExecContext(ctx, createSQL); err != nil {
 		return nil, fmt.Errorf("build docs seeds table: %w", err)
 	}
