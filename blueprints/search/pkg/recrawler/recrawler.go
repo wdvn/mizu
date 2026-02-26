@@ -153,14 +153,13 @@ func New(cfg Config, stats *Stats, rdb *ResultDB) *Recrawler {
 		cfg.MaxConnsPerDomain = 8
 	}
 
-	// Probe timeout: first request to each unknown domain uses a shorter timeout.
-	// Must be long enough for cross-continent TCP+TLS+response (~1.5-2.5s),
-	// but shorter than the full config timeout to speed up dead-domain discovery.
-	// Default: min(3s, config.Timeout). Combined with DomainFailThreshold=2,
-	// dead domains are killed after 2 consecutive timeouts (6s total).
+	// Probe timeout: first request to each unknown domain.
+	// Uses cfg.Timeout (default 5s) so slow-but-alive servers (responding in 3-5s)
+	// are not incorrectly killed. Dead domains are still killed quickly via
+	// DomainFailThreshold=2 (two consecutive timeouts → kill).
 	probeTimeout := cfg.ProbeTimeout
 	if probeTimeout == 0 {
-		probeTimeout = min(3*time.Second, cfg.Timeout)
+		probeTimeout = cfg.Timeout
 	}
 
 	r := &Recrawler{
@@ -1078,13 +1077,63 @@ func (r *Recrawler) directFeed(ctx context.Context, domains []string, domainURLs
 			return
 		}
 
-		// Probe in chunks and feed each chunk immediately after classification.
-		// This preserves the low-timeout benefit of TCP pre-probing while avoiding
-		// long "nothing happens" startup periods on 10K-100K domain runs.
+		// Fast path: domains with pre-cached DNS IPs skip TCP probe entirely.
+		// Batch DNS pre-resolution already confirmed these hosts have valid A records;
+		// TCP probe would be redundant overhead (20-50s for 2K+ domains across 4 passes).
+		// HTTP workers handle TCP-unreachable cases via the warmup semaphore (cap-1 per
+		// domain on first request) + DomainFailThreshold kill after N consecutive timeouts.
+		type dnsProbeAlive struct {
+			domain string
+			urls   []SeedURL
+		}
+		var dnsAlive []dnsProbeAlive
+		var needsProbe []tcpProbeDomainEntry
+		for _, entry := range toProbe {
+			host := strings.TrimSpace(entry.urls[0].Host)
+			if host == "" {
+				host = strings.TrimSpace(entry.urls[0].Domain)
+			}
+			r.dnsCacheMu.RLock()
+			hasDNS := len(r.dnsCache[host]) > 0 || len(r.dnsCache[entry.domain]) > 0
+			r.dnsCacheMu.RUnlock()
+			if hasDNS {
+				r.stats.RecordProbeReachable()
+				dnsAlive = append(dnsAlive, dnsProbeAlive{entry.domain, entry.urls})
+			} else {
+				needsProbe = append(needsProbe, entry)
+			}
+		}
+
+		// Feed DNS-confirmed-alive domains immediately (interleaved round-robin).
+		// Round-robin across domains prevents per-domain semaphore starvation:
+		// without interleaving, all URLs for domain A occupy the 8-conn cap before
+		// domain B gets any workers, serializing fetches unnecessarily.
+		if len(dnsAlive) > 0 {
+			cursors := make([]int, len(dnsAlive))
+			remaining := len(dnsAlive)
+			for remaining > 0 {
+				remaining = 0
+				for i, ad := range dnsAlive {
+					if cursors[i] < len(ad.urls) {
+						select {
+						case urlCh <- ad.urls[cursors[i]]:
+							cursors[i]++
+						case <-ctx.Done():
+							return
+						}
+						if cursors[i] < len(ad.urls) {
+							remaining++
+						}
+					}
+				}
+			}
+		}
+
+		// TCP probe remaining domains that lack a DNS cache entry (rare after DNS prefetch).
 		const probeChunkSize = 1000
-		for start := 0; start < len(toProbe); start += probeChunkSize {
-			end := min(start+probeChunkSize, len(toProbe))
-			if !r.tcpProbeAndFeedChunk(ctx, toProbe[start:end], urlCh) {
+		for start := 0; start < len(needsProbe); start += probeChunkSize {
+			end := min(start+probeChunkSize, len(needsProbe))
+			if !r.tcpProbeAndFeedChunk(ctx, needsProbe[start:end], urlCh) {
 				return
 			}
 		}
@@ -1190,6 +1239,10 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 
 	alive := make([]bool, len(toProbe))
 	outcomes := make([]probeOutcome, len(toProbe))
+	// origOutcomes tracks outcomes on the ORIGINAL port only.
+	// Alt-port failures are excluded so a refused port 80 cannot condemn a domain
+	// whose port 443 is merely slow (root cause of most false tcp_unreachable).
+	origOutcomes := make([]probeOutcome, len(toProbe))
 	httpRejectedHard := make([]bool, len(toProbe))
 	httpRejectErr := make([]string, len(toProbe))
 
@@ -1224,6 +1277,7 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 							alive[idx] = true
 						} else {
 							outcomes[idx] = mergeProbeOutcome(outcomes[idx], out)
+							origOutcomes[idx] = mergeProbeOutcome(origOutcomes[idx], out)
 						}
 				}
 			})
@@ -1274,6 +1328,9 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 									alive[re.idx] = true
 									continue
 								} else {
+									// Alt-port failures only count toward diagnostics.
+									// They must NOT update origOutcomes: a refused port 80 must not
+									// condemn a domain whose port 443 merely timed out.
 									outcomes[re.idx] = mergeProbeOutcome(outcomes[re.idx], out)
 								}
 							}
@@ -1281,6 +1338,7 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 								alive[re.idx] = true
 							} else {
 								outcomes[re.idx] = mergeProbeOutcome(outcomes[re.idx], out)
+								origOutcomes[re.idx] = mergeProbeOutcome(origOutcomes[re.idx], out)
 							}
 					}
 				})
@@ -1332,12 +1390,14 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 							continue
 						} else {
 							outcomes[idx] = mergeProbeOutcome(outcomes[idx], out)
+							origOutcomes[idx] = mergeProbeOutcome(origOutcomes[idx], out)
 						}
 						if altPort != "" {
 							if out := r.tcpProbeHostPort(ctx, host, altPort, e.domain, pass3Timeout); out == probeOK {
 								alive[idx] = true
 								newAlive.Add(1)
 							} else {
+								// Alt-port only: do NOT update origOutcomes here.
 								outcomes[idx] = mergeProbeOutcome(outcomes[idx], out)
 							}
 						}
@@ -1422,6 +1482,59 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 		}
 	}
 
+	// Pass 5: HTTP confirmation for original-port-refused domains.
+	// Root cause #2: some servers/CDNs RST raw TCP on port 443 without a TLS ClientHello
+	// (e.g. nginx ssl_reject_handshake, AWS ALB strict TLS) but serve HTTPS fine when a
+	// real HTTP client sends a ClientHello. An HTTP HEAD probe confirms whether the domain
+	// is truly dead before we write it off as tcp_unreachable.
+	{
+		var confirmList []int
+		for i := range toProbe {
+			if !alive[i] && !httpRejectedHard[i] && origOutcomes[i] == probeRefused {
+				confirmList = append(confirmList, i)
+			}
+		}
+		if len(confirmList) > 0 {
+			nWorkers := min(len(confirmList), 200)
+			idxCh := make(chan int, max(nWorkers*4, 1))
+			go func() {
+				defer close(idxCh)
+				for _, i := range confirmList {
+					select {
+					case idxCh <- i:
+					case <-ctx.Done():
+						return
+					}
+				}
+			}()
+			var wg sync.WaitGroup
+			for workerID := range nWorkers {
+				id := workerID
+				wg.Go(func() {
+					for idx := range idxCh {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+						ok, hardReject, errMsg := r.probeDomainHTTPReady(ctx, toProbe[idx].urls[0].URL, id)
+						if ok {
+							// HTTP succeeded despite raw TCP RST — TLS-gated server or CDN edge.
+							alive[idx] = true
+						} else if hardReject {
+							// HTTP also hard-refused: definitively dead, classify as http_probe_unreachable.
+							httpRejectedHard[idx] = true
+							httpRejectErr[idx] = errMsg
+						}
+						// !ok && !hardReject (HTTP timeout): leave origOutcomes as probeRefused.
+						// Domain is genuinely unreachable within time budget.
+					}
+				})
+			}
+			wg.Wait()
+		}
+	}
+
 	if r.config.StatusOnly || r.config.HeadOnly {
 		var candidates []int
 		for i := range toProbe {
@@ -1471,7 +1584,7 @@ func (r *Recrawler) tcpProbeAndFeedChunk(ctx context.Context, toProbe []tcpProbe
 	}
 	var aliveList []aliveDomain
 		for i, e := range toProbe {
-		if alive[i] || (!httpRejectedHard[i] && outcomes[i] != probeRefused) {
+		if alive[i] || (!httpRejectedHard[i] && origOutcomes[i] != probeRefused) {
 			r.stats.RecordProbeReachable()
 			aliveList = append(aliveList, aliveDomain{e.domain, e.urls})
 			continue
@@ -1585,13 +1698,20 @@ func (r *Recrawler) worker(ctx context.Context, client *http.Client, urls <-chan
 	}
 }
 
-// domainWarmupSem returns a per-domain cap=1 semaphore for domains that have not yet
-// succeeded. Once a domain has any successful response, warmup is bypassed.
+// domainWarmupSem returns a per-domain semaphore for domains that have not yet succeeded.
+// Once a domain has any successful response, warmup is bypassed entirely.
+//
+// Cap=2 (not 1): allows 2 concurrent probes per new domain.
+// Benefits vs cap=1:
+//  1. Peak throughput: 2× more concurrent probes → 2× higher burst rate.
+//  2. Faster dead-domain kill: both probes timeout simultaneously → fail=2 (threshold)
+//     → domain killed in one timeout round (~3s) instead of two (~6s).
+//     Workers move on to the next domain 3s sooner, improving overall efficiency.
 func (r *Recrawler) domainWarmupSem(domain string) (chan struct{}, bool) {
 	if _, ok := r.domainSucceeded.Load(domain); ok {
 		return nil, false
 	}
-	v, _ := r.domainWarmup.LoadOrStore(domain, make(chan struct{}, 1))
+	v, _ := r.domainWarmup.LoadOrStore(domain, make(chan struct{}, 2))
 	return v.(chan struct{}), true
 }
 

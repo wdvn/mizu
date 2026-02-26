@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -1627,30 +1628,145 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 	return err
 }
 
-// v3ProgressWriter wraps a ResultWriter and FailureWriter to count outcomes for live display.
+// v3SpeedTick records a point-in-time measurement for rolling speed calculation.
+type v3SpeedTick struct {
+	t     time.Time
+	total int64
+	bytes int64
+}
+
+// v3LiveStats tracks live statistics for the v3 progress display.
+// All fields are updated atomically from the result/failure writers.
+type v3LiveStats struct {
+	total   atomic.Int64 // all results received (ok + fail + timeout)
+	ok      atomic.Int64 // successful fetches (no error)
+	failed  atomic.Int64 // hard failures (non-timeout errors)
+	timeout atomic.Int64 // timeout failures
+	skipped atomic.Int64 // domain-killed (domain_http_timeout_killed)
+	bytes   atomic.Int64 // total body bytes received
+	fetchMs atomic.Int64 // sum of FetchTimeMs for successful fetches (for avg)
+
+	statusCodes sync.Map // int → *atomic.Int64
+
+	// Latency histogram for adaptive timeout display (mirrors engine's tracker)
+	latBuckets [8]atomic.Int64
+	latTotal   atomic.Int64
+
+	// Rolling speed (10-second window), protected by speedMu
+	speedMu    sync.Mutex
+	speedTicks []v3SpeedTick
+	peakRPS    float64
+	rollingRPS float64
+	rollingBW  float64
+}
+
+func (ls *v3LiveStats) recordResult(r recrawler.Result) {
+	ls.total.Add(1)
+	ls.bytes.Add(r.ContentLength)
+	if r.StatusCode > 0 {
+		v, _ := ls.statusCodes.LoadOrStore(r.StatusCode, &atomic.Int64{})
+		v.(*atomic.Int64).Add(1)
+	}
+	switch {
+	case r.Error == "":
+		ls.ok.Add(1)
+		ls.fetchMs.Add(r.FetchTimeMs)
+		// Track latency for adaptive timeout display
+		ms := r.FetchTimeMs
+		ls.latTotal.Add(1)
+		for i, edge := range v3LatEdges {
+			if ms < edge {
+				ls.latBuckets[i].Add(1)
+				return
+			}
+		}
+		ls.latBuckets[len(ls.latBuckets)-1].Add(1)
+	case strings.Contains(r.Error, "timeout") || strings.Contains(r.Error, "deadline"):
+		ls.timeout.Add(1)
+	default:
+		ls.failed.Add(1)
+	}
+}
+
+func (ls *v3LiveStats) recordSkip() {
+	ls.skipped.Add(1)
+}
+
+// updateSpeed refreshes rolling RPS and bandwidth (call every tick).
+func (ls *v3LiveStats) updateSpeed(now time.Time) {
+	tot := ls.total.Load()
+	b := ls.bytes.Load()
+
+	ls.speedMu.Lock()
+	defer ls.speedMu.Unlock()
+
+	ls.speedTicks = append(ls.speedTicks, v3SpeedTick{t: now, total: tot, bytes: b})
+	cutoff := now.Add(-10 * time.Second)
+	for len(ls.speedTicks) > 1 && ls.speedTicks[0].t.Before(cutoff) {
+		ls.speedTicks = ls.speedTicks[1:]
+	}
+
+	var rps, bw float64
+	if len(ls.speedTicks) >= 2 {
+		first := ls.speedTicks[0]
+		last := ls.speedTicks[len(ls.speedTicks)-1]
+		dt := last.t.Sub(first.t).Seconds()
+		if dt > 0 {
+			rps = float64(last.total-first.total) / dt
+			bw = float64(last.bytes-first.bytes) / dt
+		}
+	}
+	ls.rollingRPS = rps
+	ls.rollingBW = bw
+	if rps > ls.peakRPS {
+		ls.peakRPS = rps
+	}
+}
+
+func (ls *v3LiveStats) p95Ms() int64 {
+	n := ls.latTotal.Load()
+	if n < 10 {
+		return 0
+	}
+	target := int64(float64(n) * 0.95)
+	var cum int64
+	for i, edge := range v3LatEdges {
+		cum += ls.latBuckets[i].Load()
+		if cum >= target {
+			return edge
+		}
+	}
+	return v3LatEdges[len(v3LatEdges)-1]
+}
+
+var v3LatEdges = [8]int64{100, 250, 500, 1000, 2000, 3500, 5000, 10000}
+
+// v3ProgressWriter wraps ResultWriter and tracks live statistics.
 type v3ProgressWriter struct {
-	inner   recrawl_v3.ResultWriter
-	total   int64 // atomic
-	ok      int64 // atomic
-	failed  int64 // atomic
-	timeout int64 // atomic
+	inner recrawl_v3.ResultWriter
+	ls    *v3LiveStats
 }
 
 func (p *v3ProgressWriter) Add(r recrawler.Result) {
 	p.inner.Add(r)
-	atomic.AddInt64(&p.total, 1)
-	switch {
-	case r.Error == "":
-		atomic.AddInt64(&p.ok, 1)
-	case strings.Contains(r.Error, "timeout") || strings.Contains(r.Error, "deadline"):
-		atomic.AddInt64(&p.timeout, 1)
-	default:
-		atomic.AddInt64(&p.failed, 1)
-	}
+	p.ls.recordResult(r)
 }
-
 func (p *v3ProgressWriter) Flush(ctx context.Context) error { return p.inner.Flush(ctx) }
 func (p *v3ProgressWriter) Close() error                    { return p.inner.Close() }
+
+// v3ProgressFailureWriter wraps FailureWriter and counts domain-killed skips.
+type v3ProgressFailureWriter struct {
+	inner recrawl_v3.FailureWriter
+	ls    *v3LiveStats
+}
+
+func (f *v3ProgressFailureWriter) AddURL(u recrawler.FailedURL) {
+	f.inner.AddURL(u)
+	if u.Reason == "domain_http_timeout_killed" {
+		f.ls.recordSkip()
+	}
+}
+func (f *v3ProgressFailureWriter) Close() error { return f.inner.Close() }
 
 // runCCRecrawlV3 delegates crawling to a recrawl_v3 engine selected by opts.engine.
 // It is called from runCCRecrawl when --engine is set. failedDBPath dir must already exist.
@@ -1662,7 +1778,6 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	if engineName == "auto" {
 		engineName = "keepalive"
 	}
-	fmt.Println(infoStyle.Render(fmt.Sprintf("Using recrawl_v3 engine: %s (%d seeds)", engineName, len(seeds))))
 
 	eng, err := recrawl_v3.New(engineName)
 	if err != nil {
@@ -1698,19 +1813,44 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	}
 	defer rdb.Close()
 
-	fmt.Println(successStyle.Render(fmt.Sprintf("  FailedDB → %s", failedDBPath)))
-	fmt.Println(successStyle.Render(fmt.Sprintf("  Results  → %s/ (16 shards)", resultDir)))
-	fmt.Println()
+	// Print config summary
+	bodyMode := "full-body (512 KB limit)"
+	if cfg.StatusOnly {
+		bodyMode = "status-only"
+	}
+	domainFail := "disabled"
+	if cfg.DomainFailThreshold > 0 {
+		effectiveRounds := cfg.DomainFailThreshold * max(cfg.MaxConnsPerDomain, 1)
+		domainFail = fmt.Sprintf("abandon after %d total timeouts (%d rounds × %d conns)",
+			effectiveRounds, cfg.DomainFailThreshold, cfg.MaxConnsPerDomain)
+	}
+	fmt.Printf("\n  Engine            %s\n", engineName)
+	fmt.Printf("  Workers           %s\n", ccFmtInt64(int64(cfg.Workers)))
+	fmt.Printf("  Max Conns/Domain  %d\n", cfg.MaxConnsPerDomain)
+	fmt.Printf("  Timeout           %v (adaptive P95×2)\n", cfg.Timeout)
+	fmt.Printf("  Domain Fail       %s\n", domainFail)
+	fmt.Printf("  Body              %s\n", bodyMode)
+	fmt.Printf("  TLS               skip-verify\n")
+	fmt.Printf("  Seeds             %s URLs\n", ccFmtInt64(int64(len(seeds))))
+	fmt.Printf("  FailedDB          %s\n", failedDBPath)
+	fmt.Printf("  Results           %s/ (16 shards)\n\n", resultDir)
 
-	// Progress wrapper counts outcomes as results arrive.
-	pw := &v3ProgressWriter{inner: &recrawl_v3.ResultDBWriter{DB: rdb}}
+	ls := &v3LiveStats{}
+	pw := &v3ProgressWriter{
+		inner: &recrawl_v3.ResultDBWriter{DB: rdb},
+		ls:    ls,
+	}
+	fw := &v3ProgressFailureWriter{
+		inner: &recrawl_v3.FailedDBWriter{DB: failedDB},
+		ls:    ls,
+	}
 
-	// Detect TTY: use \r (in-place) for interactive; \n (new line) for SSH/pipes.
+	// Detect TTY: use escape codes for interactive; plain lines for SSH/pipes.
 	stdoutStat, statErr := os.Stdout.Stat()
 	isTTY := statErr == nil && stdoutStat.Mode()&os.ModeCharDevice != 0
 	progressInterval := 500 * time.Millisecond
 	if !isTTY {
-		progressInterval = 2 * time.Second // less noisy in logs
+		progressInterval = 2 * time.Second
 	}
 
 	// Live progress goroutine.
@@ -1719,75 +1859,224 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	progressDone := make(chan struct{})
 	start := time.Now()
 	seedTotal := int64(len(seeds))
+
 	go func() {
 		defer close(progressDone)
 		ticker := time.NewTicker(progressInterval)
 		defer ticker.Stop()
-		var lastTotal int64
-		var lastT time.Time
+		var displayLines int
 		for {
 			select {
 			case <-progressCtx.Done():
 				return
 			case t := <-ticker.C:
-				tot := atomic.LoadInt64(&pw.total)
-				ok := atomic.LoadInt64(&pw.ok)
-				fail := atomic.LoadInt64(&pw.failed)
-				tout := atomic.LoadInt64(&pw.timeout)
-				elapsed := time.Since(start)
-
-				// Rolling RPS over last interval window
-				dt := t.Sub(lastT).Seconds()
-				rollingRPS := 0.0
-				if dt > 0 {
-					rollingRPS = float64(tot-lastTotal) / dt
+				ls.updateSpeed(t)
+				output := v3RenderProgress(ls, cfg, engineName, seedTotal, start, isTTY)
+				if isTTY {
+					if displayLines > 0 {
+						fmt.Printf("\033[%dA\033[J", displayLines)
+					}
+					fmt.Print(output)
+					displayLines = strings.Count(output, "\n")
+				} else {
+					fmt.Print(output)
 				}
-				lastTotal = tot
-				lastT = t
-
-				pct := 0.0
-				if seedTotal > 0 {
-					pct = float64(tot) / float64(seedTotal) * 100
-				}
-				eta := ""
-				if rollingRPS > 0 && seedTotal > tot {
-					etaDur := time.Duration(float64(seedTotal-tot)/rollingRPS) * time.Second
-					eta = fmt.Sprintf("  ETA %s", etaDur.Truncate(time.Second))
-				}
-				eol := "\r"
-				if !isTTY {
-					eol = "\n"
-				}
-				fmt.Printf("%s  %s  %d/%d (%.0f%%)  ok=%d fail=%d tout=%d  %.0f rps%s",
-					eol,
-					elapsed.Truncate(time.Second),
-					tot, seedTotal, pct,
-					ok, fail, tout,
-					rollingRPS,
-					eta,
-				)
 			}
 		}
 	}()
 
-	stats, err := eng.Run(ctx, seeds, dnsCache, cfg,
-		pw,
-		&recrawl_v3.FailedDBWriter{DB: failedDB})
+	stats, err := eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
 	cancelProgress()
 	<-progressDone
-	if isTTY {
-		fmt.Println() // newline after \r progress line
-	}
 
+	// Final display
+	if isTTY {
+		fmt.Println()
+	}
 	if err != nil {
 		return fmt.Errorf("engine run: %w", err)
 	}
 
+	// Summary line
+	skipped := ls.skipped.Load()
+	skippedNote := ""
+	if skipped > 0 {
+		skippedNote = fmt.Sprintf("  skipped %s domain-killed", ccFmtInt64(skipped))
+	}
+	bw := ""
+	if b := ls.bytes.Load(); b > 0 {
+		bw = fmt.Sprintf("  |  %s total", v3FmtBytes(b))
+	}
 	fmt.Println(successStyle.Render(fmt.Sprintf(
-		"Engine %s done: %d ok / %d total | avg %.0f rps | peak %.0f rps | %s",
-		engineName, stats.OK, stats.Total, stats.AvgRPS, stats.PeakRPS, stats.Duration.Truncate(time.Second),
+		"Engine %s done: %s ok / %s total | avg %.0f rps | peak %.0f rps | %s%s%s",
+		engineName,
+		ccFmtInt64(stats.OK), ccFmtInt64(stats.Total),
+		stats.AvgRPS, stats.PeakRPS,
+		stats.Duration.Truncate(time.Second),
+		bw, skippedNote,
 	)))
 	return nil
+}
+
+// v3RenderProgress returns a formatted multi-line progress string.
+func v3RenderProgress(ls *v3LiveStats, cfg recrawl_v3.Config, engineName string, seedTotal int64, start time.Time, isTTY bool) string {
+	ls.speedMu.Lock()
+	rollingRPS := ls.rollingRPS
+	rollingBW := ls.rollingBW
+	peakRPS := ls.peakRPS
+	ls.speedMu.Unlock()
+
+	tot := ls.total.Load()
+	ok := ls.ok.Load()
+	fail := ls.failed.Load()
+	tout := ls.timeout.Load()
+	skip := ls.skipped.Load()
+	b := ls.bytes.Load()
+	elapsed := time.Since(start)
+
+	pct := float64(0)
+	if seedTotal > 0 {
+		pct = float64(tot) / float64(seedTotal) * 100
+	}
+
+	// ETA based on rolling speed
+	eta := "---"
+	if elapsed.Seconds() > 2 && tot > 0 {
+		speed := rollingRPS
+		if speed <= 0 {
+			speed = float64(tot) / elapsed.Seconds()
+		}
+		if speed > 0 {
+			remaining := seedTotal - tot
+			if remaining > 0 {
+				etaDur := time.Duration(float64(remaining)/speed) * time.Second
+				eta = v3FmtDur(etaDur)
+			} else {
+				eta = "0s"
+			}
+		}
+	}
+
+	// Progress bar (40 chars)
+	barWidth := 40
+	filled := min(int(pct/100*float64(barWidth)), barWidth)
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	// Avg fetch time
+	avgMs := int64(0)
+	if okN := ls.ok.Load(); okN > 0 {
+		avgMs = ls.fetchMs.Load() / okN
+	}
+
+	// Avg bandwidth
+	avgBW := float64(0)
+	if elapsed.Seconds() > 0 {
+		avgBW = float64(b) / elapsed.Seconds()
+	}
+
+	// Adaptive timeout display
+	p95 := ls.p95Ms()
+	adaptiveStr := ""
+	if p95 > 0 {
+		adapted := p95 * 2
+		if adapted < 500 {
+			adapted = 500
+		}
+		if ceil := cfg.Timeout.Milliseconds(); adapted > ceil {
+			adapted = ceil
+		}
+		adaptiveStr = fmt.Sprintf("  Adaptive  P95=%dms  →  timeout=%dms  (ceiling %v)\n", p95, adapted, cfg.Timeout)
+	}
+
+	// HTTP status codes
+	statusStr := v3StatusLine(&ls.statusCodes)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("  %s  %5.1f%%  %s/%s\n",
+		bar, pct, ccFmtInt64(tot), ccFmtInt64(seedTotal)))
+	sb.WriteString(fmt.Sprintf("  Speed   %s/s  │  Peak %s/s  │  %s/s  │  Total %s\n",
+		ccFmtInt64(int64(rollingRPS)), ccFmtInt64(int64(peakRPS)),
+		v3FmtBytes(int64(rollingBW)), v3FmtBytes(b)))
+	sb.WriteString(fmt.Sprintf("  ETA     %s  │  Elapsed %s  │  Avg %dms/req  │  Avg %s/s\n",
+		eta, v3FmtDur(elapsed), avgMs, v3FmtBytes(int64(avgBW))))
+	sb.WriteString("\n")
+	done := tot + skip
+	sb.WriteString(fmt.Sprintf("  ✓ %s ok (%4.1f%%)  ✗ %s fail (%4.1f%%)  ⏱ %s timeout (%4.1f%%)\n",
+		ccFmtInt64(ok), v3SafePct(ok, done),
+		ccFmtInt64(fail), v3SafePct(fail, done),
+		ccFmtInt64(tout), v3SafePct(tout, done)))
+	if skip > 0 {
+		sb.WriteString(fmt.Sprintf("  ⌛ %s domain-killed (%4.1f%%)\n",
+			ccFmtInt64(skip), v3SafePct(skip, done)))
+	}
+	if statusStr != "" {
+		sb.WriteString(fmt.Sprintf("  HTTP  %s\n", statusStr))
+	}
+	if adaptiveStr != "" {
+		sb.WriteString(adaptiveStr)
+	}
+	return sb.String()
+}
+
+func v3StatusLine(m *sync.Map) string {
+	type kv struct {
+		code  int
+		count int64
+	}
+	var pairs []kv
+	m.Range(func(key, value any) bool {
+		if code, ok1 := key.(int); ok1 {
+			if cnt, ok2 := value.(*atomic.Int64); ok2 {
+				if n := cnt.Load(); n > 0 {
+					pairs = append(pairs, kv{code, n})
+				}
+			}
+		}
+		return true
+	})
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].count > pairs[j].count })
+	var parts []string
+	for i, p := range pairs {
+		if i >= 8 {
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%d:%s", p.code, ccFmtInt64(p.count)))
+	}
+	return strings.Join(parts, "  ")
+}
+
+func v3SafePct(part, total int64) float64 {
+	if total == 0 {
+		return 0
+	}
+	return float64(part) / float64(total) * 100
+}
+
+func v3FmtBytes(b int64) string {
+	if b < 0 {
+		return "0 B"
+	}
+	switch {
+	case b < 1024:
+		return fmt.Sprintf("%d B", b)
+	case b < 1024*1024:
+		return fmt.Sprintf("%.1f KB", float64(b)/1024)
+	case b < 1024*1024*1024:
+		return fmt.Sprintf("%.1f MB", float64(b)/(1024*1024))
+	default:
+		return fmt.Sprintf("%.2f GB", float64(b)/(1024*1024*1024))
+	}
+}
+
+func v3FmtDur(d time.Duration) string {
+	d = d.Truncate(time.Second)
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	s := int(d.Seconds()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%02d:%02d:%02d", h, m, s)
+	}
+	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
 // newCCRecrawlDrone is the hidden subcommand spawned by SwarmEngine queen processes.

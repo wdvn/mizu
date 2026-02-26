@@ -21,8 +21,12 @@ import (
 const dnsShardCount = 64 // must be power of 2
 
 const (
-	fastDNSServerCount      = 2
-	fastDNSConnsPerServer   = 512
+	fastDNSServerCount = 2
+	// fastDNSConnsPerServer sets the UDP connection pool per server.
+	// 4096 per server × 2 servers = 8192 pool → 6144 recommended worker cap.
+	// This allows 4000+ workers for large batches (80K+ domains) while keeping
+	// each server well under its rate limit (~50K QPS for Cloudflare/Google).
+	fastDNSConnsPerServer   = 4096
 	fastDNSWorkerStableFrac = 3 // use ~75% of pool capacity for lower timeout noise
 )
 
@@ -418,12 +422,24 @@ func (d *DNSResolver) ResolveBatch(ctx context.Context, domains []string, worker
 
 	// Standard-library fallback resolver can become a bottleneck under high concurrency.
 	// Bound fallback concurrency separately so it doesn't collapse throughput.
+	// Cap at workers/4 but raised from 256 to 1024 so retry throughput scales with
+	// large worker counts (4K workers → 1K retries @ 1s = 1K/s retry throughput).
+	//
+	// stdlib is kept in the first pass even for large batches: macOS mDNSResponder
+	// serves cached DNS hits in <50ms, recovering most live domains from the previous
+	// run's DNS cache. Only the RETRY is skipped for large batches (see resolveOneBatch).
 	fallbackTimeout := batchTimeout
 	if maxWorkers >= 256 && fallbackTimeout > time.Second {
 		fallbackTimeout = time.Second
 	}
 	stdResolver := makeResolver("", fallbackTimeout)
-	fallbackLimit := min(max(maxWorkers/4, 32), 256)
+	// noRetry: for very large batches, skip the 2s retry that serializes workers.
+	// The retry recovers ~30% of timed-out domains but adds 2s × workers blocking,
+	// tripling per-domain cost (1s fastdns + 2s retry = 3s) and capping throughput
+	// at ~1,365/s instead of 4,096/s. Missed slow domains are recovered via the
+	// HTTP dialer's inline DNS fallback at fetch time.
+	noRetry := len(toResolve) >= 50000
+	fallbackLimit := min(max(maxWorkers/4, 32), 1024)
 	if len(toResolve) < fallbackLimit {
 		fallbackLimit = len(toResolve)
 	}
@@ -435,7 +451,7 @@ func (d *DNSResolver) ResolveBatch(ctx context.Context, domains []string, worker
 	for range maxWorkers {
 		wg.Go(func() {
 			for domain := range ch {
-				d.resolveOneBatch(ctx, domain, clients, stdResolver, fallbackSem, batchTimeout)
+				d.resolveOneBatch(ctx, domain, clients, stdResolver, fallbackSem, batchTimeout, noRetry)
 			}
 		})
 	}
@@ -484,7 +500,8 @@ drain:
 
 // resolveOneBatch resolves a single domain using concurrent multi-server lookups.
 // All DNS servers (fastdns + stdlib) are queried simultaneously; first success wins.
-func (d *DNSResolver) resolveOneBatch(ctx context.Context, domain string, clients []*fastdns.Client, stdResolver *net.Resolver, fallbackSem chan struct{}, batchTimeout time.Duration) {
+// noRetry skips the 2s stdlib retry for large batches to eliminate per-worker serial blocking.
+func (d *DNSResolver) resolveOneBatch(ctx context.Context, domain string, clients []*fastdns.Client, stdResolver *net.Resolver, fallbackSem chan struct{}, batchTimeout time.Duration, noRetry bool) {
 	totalResolvers := len(clients)
 	if stdResolver != nil {
 		totalResolvers++
@@ -581,7 +598,9 @@ func (d *DNSResolver) resolveOneBatch(ctx context.Context, domain string, client
 	// For timeout failures: retry once with doubled timeout via stdlib only.
 	// DNS timeouts are often transient (packet loss), not permanent.
 	// This recovers ~30-50% of timeout domains with minimal overhead.
-	if stdResolver != nil && lastErr != nil && isTimeoutErr(lastErr) {
+	// noRetry skips this for large batches where the 2s wait serializes workers
+	// and triples per-domain cost (1s first-pass + 2s retry = 3s per dead domain).
+	if !noRetry && stdResolver != nil && lastErr != nil && isTimeoutErr(lastErr) {
 		retryTimeout := min(batchTimeout*2, 4*time.Second)
 		retryCtx, retryCancel := context.WithTimeout(ctx, retryTimeout)
 		select {

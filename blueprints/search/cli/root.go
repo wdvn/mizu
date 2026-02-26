@@ -81,6 +81,7 @@ Get started:
 	root.AddCommand(NewQQ())
 	root.AddCommand(NewHN())
 	root.AddCommand(NewLocal())
+	root.AddCommand(NewRSS())
 
 	if err := fang.Execute(ctx, root,
 		fang.WithVersion(Version),

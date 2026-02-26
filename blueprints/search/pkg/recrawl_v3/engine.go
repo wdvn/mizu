@@ -24,6 +24,8 @@ type Stats struct {
 	OK       int64
 	Failed   int64
 	Timeout  int64
+	Skipped  int64         // URLs skipped because domain was abandoned
+	Bytes    int64         // total bytes received (body size)
 	PeakRPS  float64
 	AvgRPS   float64
 	Duration time.Duration
@@ -33,26 +35,28 @@ type Stats struct {
 
 // Config configures any engine.
 type Config struct {
-	Workers           int           // concurrent workers (engines A, D, C-drone)
-	Timeout           time.Duration // per-request HTTP timeout
-	StatusOnly        bool          // discard body, read status line only
-	MaxConnsPerDomain int           // max simultaneous connections per domain (engine A)
-	UserAgent         string
-	InsecureTLS       bool   // skip TLS verification
-	DroneCount        int    // swarm engine: number of drone processes (engine C)
-	SearchBinary      string // path to self binary (engine C drones re-exec it)
+	Workers             int           // concurrent workers (engines A, D, C-drone)
+	Timeout             time.Duration // per-request HTTP timeout
+	StatusOnly          bool          // discard body, read status line only
+	MaxConnsPerDomain   int           // max simultaneous connections per domain (engine A)
+	UserAgent           string
+	InsecureTLS         bool   // skip TLS verification
+	DroneCount          int    // swarm engine: number of drone processes (engine C)
+	SearchBinary        string // path to self binary (engine C drones re-exec it)
+	DomainFailThreshold int    // consecutive timeouts before abandoning a domain (0=disabled)
 }
 
 // DefaultConfig returns sensible defaults for the remote server.
 func DefaultConfig() Config {
 	return Config{
-		Workers:           1500,
-		Timeout:           5 * time.Second,
-		StatusOnly:        true,
-		MaxConnsPerDomain: 4,
-		UserAgent:         "MizuCrawler/3.0",
-		InsecureTLS:       true,
-		DroneCount:        4,
+		Workers:             1500,
+		Timeout:             5 * time.Second,
+		StatusOnly:          false, // default to full body download
+		MaxConnsPerDomain:   4,
+		UserAgent:           "MizuCrawler/3.0",
+		InsecureTLS:         true,
+		DroneCount:          4,
+		DomainFailThreshold: 3, // abandon domain after 3 consecutive timeouts
 	}
 }
 
