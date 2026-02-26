@@ -72,6 +72,7 @@ Subcommands:
 	cmd.AddCommand(newCCWarc())
 	cmd.AddCommand(newCCURL())
 	cmd.AddCommand(newCCRecrawl())
+	cmd.AddCommand(newCCRecrawlDrone())
 	cmd.AddCommand(newCCVerify())
 	cmd.AddCommand(newCCSite())
 
@@ -1686,6 +1687,26 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		engineName, stats.OK, stats.Total, stats.AvgRPS, stats.PeakRPS, stats.Duration.Truncate(time.Second),
 	)))
 	return nil
+}
+
+// newCCRecrawlDrone is the hidden subcommand spawned by SwarmEngine queen processes.
+// It reads seed URLs as JSON lines from stdin and crawls them using KeepAliveEngine.
+func newCCRecrawlDrone() *cobra.Command {
+	var droneID int
+	cmd := &cobra.Command{
+		Use:    "recrawl-drone",
+		Hidden: true,
+		Short:  "Internal: drone worker for swarm engine",
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg := recrawl_v3.DefaultConfig()
+			cfg.Workers = 500
+			cfg.StatusOnly = true
+			cfg.InsecureTLS = true
+			return recrawl_v3.RunDrone(cmd.Context(), cfg)
+		},
+	}
+	cmd.Flags().IntVar(&droneID, "drone-id", 0, "Drone index (used for log prefix)")
+	return cmd
 }
 
 // ── cc verify ──────────────────────────────────────────────
