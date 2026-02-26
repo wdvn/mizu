@@ -337,7 +337,7 @@ func runRecrawl(ctx context.Context, dbPath string, cfg recrawler.Config) error 
 	fmt.Printf("  %s %s\n", labelStyle.Render("Merged output:"), labelStyle.Render(mergedResultsPath))
 
 	fmt.Println(infoStyle.Render("Opening failed database..."))
-	fdb, err := recrawler.NewFailedDB(failedDBPath)
+	fdb, err := recrawler.OpenFailedDB(failedDBPath)
 	if err != nil {
 		_ = rdb.Close()
 		return fmt.Errorf("opening failed db: %w", err)

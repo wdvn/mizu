@@ -84,8 +84,8 @@ func OpenFailedDB(path string) (*FailedDB, error) {
 }
 
 // removeIfStaleLocked checks the DuckDB .lock file alongside dbPath.
-// If it exists and the recorded PID belongs to a dead process, both the
-// lock file and the database file are removed so the next open succeeds.
+// If it exists and the recorded PID belongs to a dead process, the lock
+// file is removed so the next open succeeds. The DB file is left intact.
 func removeIfStaleLocked(dbPath string) {
 	lockPath := dbPath + ".lock"
 	data, err := os.ReadFile(lockPath)
@@ -102,9 +102,9 @@ func removeIfStaleLocked(dbPath string) {
 	if processIsAlive(pid) {
 		return // genuine live lock — don't touch it
 	}
-	// Dead process: remove stale lock + corrupted/incomplete db
+	// Dead process: remove stale lock so next open succeeds.
+	// Do NOT delete the DB file — DuckDB WAL recovery handles incomplete transactions.
 	os.Remove(lockPath)
-	os.Remove(dbPath)
 }
 
 // parseLockFilePID extracts the PID from DuckDB lock file content.

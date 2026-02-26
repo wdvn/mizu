@@ -11,11 +11,10 @@ func TestOpenFailedDB_RemovesStaleLock(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "failed.duckdb")
 
-	// Create a fake .lock file with a dead PID (99999999 almost certainly doesn't exist)
+	// Create a fake .lock file with a dead PID (99999999 almost certainly doesn't exist).
+	// No DB file is pre-created; DuckDB will create a fresh one after the stale lock is removed.
 	lockPath := path + ".lock"
 	os.WriteFile(lockPath, []byte("PID=99999999\n"), 0644)
-	// Create a dummy db file that is NOT a valid DuckDB (so if stale detection fails, open will fail)
-	os.WriteFile(path, []byte("not a real db"), 0644)
 
 	db, err := OpenFailedDB(path)
 	if err != nil {
