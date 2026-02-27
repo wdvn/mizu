@@ -2,11 +2,16 @@ package crawl
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/binary"
+	"encoding/gob"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,10 +19,10 @@ import (
 	"github.com/go-mizu/mizu/blueprints/search/pkg/archived/recrawler"
 )
 
-// SwarmEngine spawns N drone sub-processes (one per CPU), distributes seeds by
-// domain hash for locality (all URLs of a domain go to the same drone), and
-// aggregates stats from each drone's stdout.
-// If SearchBinary is empty or DroneCount <= 1, falls back to KeepAliveEngine.
+// SwarmEngine spawns DroneCount drone sub-processes, distributes seeds by domain hash
+// for connection-reuse locality, and aggregates final stats from each drone stdout.
+//
+// Requires cfg.SwarmResultDir and cfg.SearchBinary to be set; otherwise falls back to KeepAliveEngine.
 type SwarmEngine struct{}
 
 // droneStats is the JSON a drone writes to stdout every 500ms.
@@ -29,10 +34,53 @@ type droneStats struct {
 	RPS     float64 `json:"rps"`
 }
 
+// dnsFrame is the DNS snapshot sent from queen to each drone via stdin (gob-encoded).
+type dnsFrame struct {
+	Resolved map[string]string // host → first IP
+	Dead     map[string]bool   // host → NXDOMAIN
+}
+
+// buildDNSFrame iterates over seeds and snapshots Lookup/IsDead for every unique host.
+func buildDNSFrame(seeds []recrawler.SeedURL, dns DNSCache) dnsFrame {
+	resolved := make(map[string]string, 1024)
+	dead := make(map[string]bool, 256)
+	seen := make(map[string]struct{}, 1024)
+	for _, s := range seeds {
+		h := s.Host
+		if h == "" {
+			h = s.Domain
+		}
+		if _, ok := seen[h]; ok {
+			continue
+		}
+		seen[h] = struct{}{}
+		if dns.IsDead(h) {
+			dead[h] = true
+		} else if ip, ok := dns.Lookup(h); ok {
+			resolved[h] = ip
+		}
+	}
+	return dnsFrame{Resolved: resolved, Dead: dead}
+}
+
+// writeDNSFrame encodes frame as gob prefixed by a 4-byte big-endian length.
+func writeDNSFrame(w io.Writer, frame dnsFrame) error {
+	var buf bytes.Buffer
+	if err := gob.NewEncoder(&buf).Encode(frame); err != nil {
+		return err
+	}
+	b := buf.Bytes()
+	if err := binary.Write(w, binary.BigEndian, uint32(len(b))); err != nil {
+		return err
+	}
+	_, err := w.Write(b)
+	return err
+}
+
 func (e *SwarmEngine) Run(ctx context.Context, seeds []recrawler.SeedURL,
 	dns DNSCache, cfg Config, results ResultWriter, failures FailureWriter) (*Stats, error) {
 
-	if cfg.SearchBinary == "" || cfg.DroneCount <= 1 {
+	if cfg.SearchBinary == "" || cfg.DroneCount <= 1 || cfg.SwarmResultDir == "" {
 		return (&KeepAliveEngine{}).Run(ctx, seeds, dns, cfg, results, failures)
 	}
 
@@ -40,9 +88,10 @@ func (e *SwarmEngine) Run(ctx context.Context, seeds []recrawler.SeedURL,
 	buckets := make([][]recrawler.SeedURL, n)
 	for _, s := range seeds {
 		h := fnvHash(s.Domain)
-		idx := int(h % uint32(n))
-		buckets[idx] = append(buckets[idx], s)
+		buckets[int(h%uint32(n))] = append(buckets[int(h%uint32(n))], s)
 	}
+
+	frame := buildDNSFrame(seeds, dns)
 
 	var (
 		totalOK      atomic.Int64
@@ -59,7 +108,13 @@ func (e *SwarmEngine) Run(ctx context.Context, seeds []recrawler.SeedURL,
 		wg.Add(1)
 		go func(droneIdx int, droneSeeds []recrawler.SeedURL) {
 			defer wg.Done()
-			if err := runDroneProcess(ctx, cfg.SearchBinary, droneIdx, droneSeeds,
+			if len(droneSeeds) == 0 {
+				return
+			}
+			droneResultDir := filepath.Join(cfg.SwarmResultDir, fmt.Sprintf("d%d", droneIdx))
+			droneFailedDB := filepath.Join(cfg.SwarmFailedDir, fmt.Sprintf("failed_%d.duckdb", droneIdx))
+			if err := runDroneProcess(ctx, cfg, droneIdx, droneSeeds, frame,
+				droneResultDir, droneFailedDB,
 				&totalOK, &totalFailed, &totalTimeout, &totalReqs, peak); err != nil {
 				fmt.Fprintf(os.Stderr, "[swarm] drone %d error: %v\n", droneIdx, err)
 			}
@@ -85,14 +140,25 @@ func (e *SwarmEngine) Run(ctx context.Context, seeds []recrawler.SeedURL,
 	}, nil
 }
 
-func runDroneProcess(ctx context.Context, binary string, idx int, seeds []recrawler.SeedURL,
+func runDroneProcess(ctx context.Context, cfg Config, idx int, seeds []recrawler.SeedURL,
+	frame dnsFrame, resultDir, failedDB string,
 	ok, failed, timeout, total *atomic.Int64, peak *peakTracker) error {
 
-	if len(seeds) == 0 {
-		return nil
+	args := []string{
+		"cc", "recrawl-drone",
+		fmt.Sprintf("--drone-id=%d", idx),
+		fmt.Sprintf("--workers=%d", cfg.Workers),
+		fmt.Sprintf("--timeout=%d", cfg.Timeout.Milliseconds()),
+		fmt.Sprintf("--max-conns-per-domain=%d", cfg.MaxConnsPerDomain),
+		fmt.Sprintf("--status-only=%v", cfg.StatusOnly),
+		fmt.Sprintf("--batch-size=%d", max(cfg.BatchSize, 1000)),
+		fmt.Sprintf("--result-dir=%s", resultDir),
+		fmt.Sprintf("--failed-db=%s", failedDB),
+		fmt.Sprintf("--domain-fail-threshold=%d", cfg.DomainFailThreshold),
+		fmt.Sprintf("--domain-timeout=%d", cfg.DomainTimeout.Milliseconds()),
 	}
-	cmd := exec.CommandContext(ctx, binary, "cc", "recrawl-drone",
-		fmt.Sprintf("--drone-id=%d", idx))
+
+	cmd := exec.CommandContext(ctx, cfg.SearchBinary, args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return fmt.Errorf("stdin pipe: %w", err)
@@ -107,30 +173,41 @@ func runDroneProcess(ctx context.Context, binary string, idx int, seeds []recraw
 		return fmt.Errorf("start: %w", err)
 	}
 
-	// Write seeds as JSON lines to drone stdin, then close
-	enc := json.NewEncoder(stdin)
-	for _, s := range seeds {
-		if err := enc.Encode(s); err != nil {
-			break
+	// Write DNS frame then seed JSON lines to drone stdin, then close.
+	go func() {
+		defer stdin.Close()
+		if err := writeDNSFrame(stdin, frame); err != nil {
+			fmt.Fprintf(os.Stderr, "[swarm] drone %d frame write error: %v\n", idx, err)
+			return
 		}
-	}
-	stdin.Close()
+		enc := json.NewEncoder(stdin)
+		for _, s := range seeds {
+			if err := enc.Encode(s); err != nil {
+				break
+			}
+		}
+	}()
 
-	// Read droneStats JSON lines from drone stdout
+	// Drain stdout; keep only the last stats line (final report from drone).
+	var finalStats droneStats
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		var ds droneStats
-		if err := json.Unmarshal(scanner.Bytes(), &ds); err != nil {
-			continue
+		if json.Unmarshal(scanner.Bytes(), &ds) == nil {
+			finalStats = ds
+			peak.Record()
 		}
-		ok.Add(ds.OK)
-		failed.Add(ds.Failed)
-		timeout.Add(ds.Timeout)
-		total.Add(ds.Total)
-		peak.Record()
 	}
 
-	return cmd.Wait()
+	if err := cmd.Wait(); err != nil {
+		fmt.Fprintf(os.Stderr, "[swarm] drone %d exited with error: %v\n", idx, err)
+	}
+
+	ok.Add(finalStats.OK)
+	failed.Add(finalStats.Failed)
+	timeout.Add(finalStats.Timeout)
+	total.Add(finalStats.Total)
+	return nil
 }
 
 // fnvHash computes FNV-1a hash of s, used for domain→drone assignment.
