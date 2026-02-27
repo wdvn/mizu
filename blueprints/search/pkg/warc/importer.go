@@ -273,23 +273,26 @@ func detectLanguageFromHeaders(h textproto.MIMEHeader) string {
 
 func extractPageInfo(body []byte) (title, desc string) {
 	s := string(body)
-	// Title
+	lower := strings.ToLower(s)
+	// Title: search in s directly (tags are ASCII, positions match)
 	if i := strings.Index(s, "<title"); i >= 0 {
 		if j := strings.Index(s[i:], ">"); j >= 0 {
 			start := i + j + 1
-			if end := strings.Index(strings.ToLower(s[start:]), "</title>"); end >= 0 {
-				title = strings.TrimSpace(s[start : start+end])
+			// Use lower[start:] for case-insensitive end search, clamp for safety
+			sub := lower[min(start, len(lower)):]
+			if end := strings.Index(sub, "</title>"); end >= 0 {
+				safeEnd := min(start+end, len(s))
+				title = strings.TrimSpace(s[start:safeEnd])
 				if len(title) > 500 {
 					title = title[:500]
 				}
 			}
 		}
 	}
-	// Meta description
-	lower := strings.ToLower(s)
+	// Meta description: pass lower (not s) so attrPos indices stay consistent
 	for _, attr := range []string{`name="description"`, `name='description'`, `property="og:description"`} {
 		if idx := strings.Index(lower, attr); idx >= 0 {
-			desc = extractMetaContent(s, idx)
+			desc = extractMetaContent(lower, idx)
 			if desc != "" {
 				break
 			}
@@ -298,12 +301,19 @@ func extractPageInfo(body []byte) (title, desc string) {
 	return
 }
 
+// extractMetaContent extracts the content="..." value from the region around attrPos.
+// s must already be lowercased (pass lower from extractPageInfo).
 func extractMetaContent(s string, attrPos int) string {
+	if attrPos > len(s) {
+		return ""
+	}
 	region := s[max(attrPos-200, 0):min(attrPos+500, len(s))]
-	lower := strings.ToLower(region)
-	if i := strings.Index(lower, `content="`); i >= 0 {
+	if i := strings.Index(region, `content="`); i >= 0 {
 		start := i + 9
-		if end := strings.Index(lower[start:], `"`); end >= 0 {
+		if start >= len(region) {
+			return ""
+		}
+		if end := strings.Index(region[start:], `"`); end >= 0 {
 			v := strings.TrimSpace(region[start : start+end])
 			if len(v) > 1000 {
 				v = v[:1000]

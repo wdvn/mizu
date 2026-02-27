@@ -312,7 +312,7 @@ func runCCWarcDownload(ctx context.Context, crawlID, fileIdx string, workers int
 	}
 	model.Overall.Total = totalBytes
 
-	p := tea.NewProgram(model)
+	p := tea.NewProgram(model, tea.WithInput(os.Stdin))
 	go func() {
 		for i, idx := range selected {
 			i := i
@@ -481,8 +481,8 @@ func streamAndFilter(ctx context.Context, r *warc.Reader, opts warc.ImportOption
 			io.Copy(io.Discard, rec.Body)
 			continue
 		}
-		wr, ok := extractWARCRecord(rec, opts)
-		if !ok {
+		wr, skip := extractWARCRecord(rec, opts)
+		if skip {
 			continue
 		}
 		if !fn(wr) {
@@ -570,7 +570,7 @@ func runCCWarcImport(ctx context.Context, crawlID, fileIdx, mimeFilter string, s
 		fmt.Sprintf("Importing WARC — %s", crawlID),
 		labels,
 	)
-	p := tea.NewProgram(model)
+	p := tea.NewProgram(model, tea.WithInput(os.Stdin))
 
 	go func() {
 		var totalImported int64
