@@ -104,6 +104,29 @@ func (e *SwarmEngine) Run(ctx context.Context, seeds []recrawler.SeedURL,
 	peak := &peakTracker{}
 	var wg sync.WaitGroup
 
+	// ProgressFunc relay: report cumulative totals every 500ms while drones run.
+	if cfg.ProgressFunc != nil {
+		progressCtx, cancelProgress := context.WithCancel(ctx)
+		progressDone := make(chan struct{})
+		go func() {
+			defer close(progressDone)
+			ticker := time.NewTicker(500 * time.Millisecond)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-progressCtx.Done():
+					return
+				case <-ticker.C:
+					cfg.ProgressFunc(totalOK.Load(), totalFailed.Load(), totalTimeout.Load())
+				}
+			}
+		}()
+		defer func() {
+			cancelProgress()
+			<-progressDone
+		}()
+	}
+
 	for i := range n {
 		wg.Add(1)
 		go func(droneIdx int, droneSeeds []recrawler.SeedURL) {
@@ -191,25 +214,25 @@ func runDroneProcess(ctx context.Context, cfg Config, idx int, seeds []recrawler
 		}
 	}()
 
-	// Drain stdout; keep only the last stats line (final report from drone).
-	var finalStats droneStats
+	// Drain stdout; accumulate stats as deltas so totals stay live during the run.
+	var prevOK, prevFailed, prevTimeout int64
 	scanner := bufio.NewScanner(stdout)
 	for scanner.Scan() {
 		var ds droneStats
 		if json.Unmarshal(scanner.Bytes(), &ds) == nil {
-			finalStats = ds
-			peak.Record()
+			ok.Add(ds.OK - prevOK)
+			failed.Add(ds.Failed - prevFailed)
+			timeout.Add(ds.Timeout - prevTimeout)
+			total.Add((ds.OK + ds.Failed + ds.Timeout) - (prevOK + prevFailed + prevTimeout))
+			prevOK = ds.OK
+			prevFailed = ds.Failed
+			prevTimeout = ds.Timeout
 		}
 	}
 
 	if err := cmd.Wait(); err != nil {
 		fmt.Fprintf(os.Stderr, "[swarm] drone %d exited with error: %v\n", idx, err)
 	}
-
-	ok.Add(finalStats.OK)
-	failed.Add(finalStats.Failed)
-	timeout.Add(finalStats.Timeout)
-	total.Add(finalStats.Total)
 	return nil
 }
 

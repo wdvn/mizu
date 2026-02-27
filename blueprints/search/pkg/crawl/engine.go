@@ -54,6 +54,10 @@ type Config struct {
 	// Swarm drone – set from --result-dir / --failed-db CLI flags.
 	SwarmFailedDB string // this drone's failed DB path (e.g. SwarmFailedDir/failed_0.duckdb)
 	BatchSize     int    // DB write batch size for ResultDB
+
+	// ProgressFunc is called by the swarm engine every 500ms with cumulative
+	// ok/failed/timeout totals from all drones. Nil-safe.
+	ProgressFunc func(ok, failed, timeout int64)
 }
 
 // DomainNotifier receives domain lifecycle events from the engine.
