@@ -418,9 +418,6 @@ func swarmProcessDomain(ctx context.Context, urls []recrawler.SeedURL,
 			client := &http.Client{
 				Transport: transport,
 				Timeout:   cfg.Timeout,
-				CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-					return http.ErrUseLastResponse
-				},
 			}
 			for seed := range urlCh {
 				select {
