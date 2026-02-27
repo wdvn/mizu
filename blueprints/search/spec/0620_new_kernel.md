@@ -186,21 +186,54 @@ rm -f ~/data/hn/recrawl/failed.duckdb
 
 ---
 
-## Benchmark Results (fill in after running)
+## Benchmark Results
 
 ### Noble binary vs Focal binary (devnull, 200K seeds, --no-retry)
 
-| Binary | Avg rps | Peak rps | Duration | Notes |
-|--------|---------|----------|----------|-------|
-| focal  | 5,158   | 9,673    | 25s      | baseline (from 0619 benchmarks) |
-| noble  | TBD     | TBD      | TBD      | GCC 14, glibc 2.39 |
+| Binary | Avg rps | Peak rps | Duration | Workers | Notes |
+|--------|---------|----------|----------|---------|-------|
+| focal  | 5,158   | 9,673    | 25s      | ?       | baseline (from 0619 benchmarks) |
+| noble  | 3,994   | 8,982    | 32s      | 8,192   | GCC 14, glibc 2.39; workers=8192 (fd-capped) |
+
+> **Note:** Noble vs focal comparison is not perfectly apples-to-apples — different worker
+> counts and network conditions between runs. Both achieve ~9K rps peak; avg difference
+> reflects different warm-up and long-tail domain timing.
 
 ### Noble binary: bin writer after Flush fix (200K seeds, --no-retry)
 
-| Writer  | Avg rps | Peak rps | Duration | Chan fill | Notes |
-|---------|---------|----------|----------|-----------|-------|
-| devnull | TBD     | TBD      | TBD      | N/A       |       |
-| bin(gob)| TBD     | TBD      | TBD      | TBD       | fixed |
+| Writer         | Avg rps | Peak rps | Duration | Chan fill | OK count | Notes |
+|----------------|---------|----------|----------|-----------|----------|-------|
+| focal devnull  | 5,158   | 9,673    | 25s      | N/A       | 7,278    | baseline |
+| focal bin(gob) | 2,355   | 9,216    | 55s      | **100%**  | 30,746   | pre-fix |
+| noble devnull  | 3,994   | 8,982    | 32s      | N/A       | 5,829    | post-fix (no writer) |
+| noble bin(gob) | 2,547   | 9,363    | 50s      | **100%**  | 35,031   | post-fix |
+
+### Flush Fix Analysis
+
+**Improvement:** ~8% faster (50s vs 55s, 2,547 vs 2,355 avg rps).
+
+**Drain behavior:** Works as designed — `drain=0` during crawl (rdb.Add() batches without Flush),
+then `drain` counts appear at ~t=44s jumping to 47K → 57K → 69K at end. Single Flush after
+all segments complete.
+
+**chan=100% persists** — the Flush per segment was not the sole cause of backpressure.
+The bottleneck analysis reveals two layers:
+
+1. **drainer bottleneck (partially fixed):** Removing Flush per segment saves 12–16s per
+   segment in the drainer goroutine. But `rdb.Add()` calls inside `drainSeg()` are still
+   slow (~30s per 64MB segment to drain). DuckDB batch inserts with `checkpoint every 10 batches`
+   add latency without the Flush.
+
+2. **flusher bottleneck (still present):** At peak 8K–9K req/s with workers=8192, the
+   single-threaded gob encoder + bufio writes can't consume records faster than workers
+   produce them. The 32K channel fills in ~6s at peak throughput.
+
+**Root cause of remaining chan=100%:** At 8,192 workers × 4 conns = 32,768 concurrent
+connections, peak throughput exceeds single-threaded gob encode capacity. This is a
+structural limit of the single-flusher design at this worker count.
+
+**Path to fix chan=100%:** Either cap workers at ~2,048 (8×innerN cap) when using bin writer,
+or implement parallel flusher goroutines (each writing to its own segment file shard).
 
 ---
 
@@ -230,15 +263,16 @@ The `deploy-linux-noble` target:
 
 ---
 
-## Status: In Progress
+## Status: Complete
 
 - [x] Created `Dockerfile.linux-focal` (Ubuntu 20.04, GCC 11, max compat)
 - [x] Created `Dockerfile.linux-noble` (Ubuntu 24.04, GCC 14, no bundled libstdc++)
 - [x] Updated Makefile: `build-linux-noble`, `deploy-linux-noble`, renamed defaults
 - [x] Identified BinSegWriter drain bottleneck (`rdb.Flush()` per segment)
-- [ ] Fix BinSegWriter drain: defer Flush to after all segments drained
-- [ ] Build noble binary (`make build-linux-noble`)
-- [ ] Deploy noble binary to server2 (`make deploy-linux-noble SERVER=2`)
-- [ ] Run noble vs focal devnull benchmark
-- [ ] Run noble bin-writer benchmark with drain fix
-- [ ] Fill in benchmark results table
+- [x] Fix BinSegWriter drain: defer Flush to after all segments drained (`23628e1f`)
+- [x] Build noble binary (`make build-linux-noble`) — `v0.5.24-66-g23628e1f`
+- [x] Deploy noble binary to server2 (`make deploy-linux-noble SERVER=2`)
+- [x] Run noble vs focal devnull benchmark — noble 3,994 avg / 8,982 peak / 32s
+- [x] Run noble bin-writer benchmark with drain fix — 2,547 avg / 9,363 peak / 50s
+- [x] Fill in benchmark results table
+- [ ] **Future:** Fix chan=100% — cap workers or implement parallel flusher shards
