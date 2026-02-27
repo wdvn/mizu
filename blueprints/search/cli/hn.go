@@ -830,6 +830,15 @@ func runHNRecrawlV3(ctx context.Context,
 
 	ls := &v3LiveStats{slowDomainMs: slowDomainMs}
 	cfg.Notifier = ls
+	// For swarm engine: relay live drone stats directly to display atomics.
+	if engineName == "swarm" {
+		cfg.ProgressFunc = func(ok, failed, timeout int64) {
+			ls.ok.Store(ok)
+			ls.failed.Store(failed)
+			ls.timeout.Store(timeout)
+			ls.total.Store(ok + failed + timeout)
+		}
+	}
 	pw := &v3ProgressWriter{
 		inner: &crawl.ResultDBWriter{DB: rdb},
 		ls:    ls,
