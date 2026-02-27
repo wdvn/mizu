@@ -140,6 +140,18 @@ remote-recrawl-bg: ## Run cc recrawl --file p:0 --status-only on remote (backgro
 remote-tail: ## Tail recrawl log on remote
 	@$(SSH) $(REMOTE_SSH) 'tail -f ~/recrawl.log'
 
+.PHONY: remote-hn-recrawl-swarm
+remote-hn-recrawl-swarm: ## Run hn recrawl --engine swarm (body mode) on remote server
+	@$(SSH) $(REMOTE_SSH) 'bash -lc "~/bin/search hn recrawl --engine swarm --workers 3000 --status-only=false --domain-timeout 30000"'
+
+.PHONY: remote-hn-recrawl-swarm-bg
+remote-hn-recrawl-swarm-bg: ## Run hn recrawl swarm in background (~/hn-swarm.log)
+	@$(SSH) $(REMOTE_SSH) 'bash -lc "nohup ~/bin/search hn recrawl --engine swarm --workers 3000 --status-only=false --domain-timeout 30000 >~/hn-swarm.log 2>&1 & echo PID:$$!"'
+
+.PHONY: remote-hn-tail
+remote-hn-tail: ## Tail hn swarm recrawl log on remote
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/hn-swarm.log'
+
 .PHONY: install
 install: build ## Install search binary to $$HOME/bin/search (alias for build)
 
