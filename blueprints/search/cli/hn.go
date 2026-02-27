@@ -804,7 +804,7 @@ func runHNRecrawlV3(ctx context.Context,
 	defer rdb.Close()
 
 	// Print config summary
-	bodyMode := "full-body (512 KB limit)"
+	bodyMode := "full-body (256 KB limit)"
 	if cfg.StatusOnly {
 		bodyMode = "status-only"
 	}
