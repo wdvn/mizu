@@ -227,6 +227,84 @@ _Goal is achievable; requires better seed quality, not more hardware._
 
 ---
 
+## Two-Pass Retry System (2026-02-27)
+
+### Motivation
+
+With 2s timeout in pass 1, ~95% of URLs timeout — but many of those servers ARE alive and respond in 2–5s. A second pass with a longer timeout rescues them, eliminating false negatives.
+
+### Implementation
+
+**`cli/hn.go`** changes:
+- `--retry-timeout` flag (default: `5000` ms) — timeout for pass 2
+- `--no-retry` flag — skip pass 2 (for benchmarking pass 1 in isolation)
+- `--workers/2` for pass 2 (slow servers need fewer concurrent connections, not more)
+- `DomainFailThreshold=1` for pass 2 (more lenient)
+- `DomainTimeout = retryTimeout × 3` for pass 2 (slow domains get more time)
+
+**DuckDB connection fix:**
+
+DuckDB only allows one connection per file. `LoadTimeoutURLs` opens failedDB read-only while it's still open read-write from pass 1 → `"Can't open a connection to same database file with a different configuration"`. Fix: close failedDB before `LoadTimeoutURLs`, reopen fresh `failedDB2` for pass 2 writes.
+
+```go
+// Before:  defer failedDB.Close()
+// After:   closure-based defer with failedDBDone flag
+failedDBDone := false
+defer func() {
+    if !failedDBDone { failedDB.Close() }
+}()
+// ...
+// In pass 2:
+failedDBDone = true
+failedDB.Close()                              // flush + release DuckDB
+retrySeeds, _ := recrawler.LoadTimeoutURLs(failedDBPath)  // read-only open OK now
+failedDB2, _ := recrawler.OpenFailedDB(failedDBPath)      // reopen for pass 2 writes
+defer failedDB2.Close()
+```
+
+### Additional Fixes Applied
+
+**GODEBUG=netdns=go** (Makefile `deploy-linux` wrapper):
+- CGO DNS (`getaddrinfo`) pins OS threads and ignores Go context cancellation → domains appeared "stuck" for 10–14 minutes even after `DomainTimeout=30s` fired
+- Fix: `export GODEBUG=netdns=go` in the `~/bin/search` wrapper forces pure Go DNS resolver
+- Result: domain drain improved significantly; pure Go DNS respects context cancellation
+
+**DuckDB checkpoint blocking** (root cause of domain drain):
+- `flushCh` buffer=2 causes HTTP worker goroutines to block at `s.flushCh <- batch` when DuckDB flusher is slow
+- Confirmed via SIGQUIT goroutine dump: `goroutine 4543469 [chan send, 10 minutes]`
+- Root cause: dirty WAL from multiple SIGKILL'd runs triggered a DuckDB checkpoint (10+ minutes)
+- Fix: delete stale DuckDB result files before each run → no WAL recovery → no checkpoint → peak climbs from 5,447/s → **10,832/s**
+
+**workers/4 → workers/2 for pass 2:**
+- Pass 2 with workers/4 = 2,048 → too conservative, slow retry throughput
+- Changed to workers/2 = 4,096 → ~2,476 RPS peak in pass 2
+
+### Two-Pass Benchmark Results (server2, --limit 200K, 2026-02-27)
+
+**Seeds:** 200K → 129,591 after DNS filter (70,409 dead/timeout filtered)
+
+| Pass | Timeout | Workers | Seeds | Avg rps | Peak rps | OK | OK% | Timeout% | Duration |
+|------|---------|---------|-------|---------|----------|-----|-----|---------|---------|
+| Pass 1 | 2s | 8,192 | 129,591 | 2,573 | **10,832** | 4,889 | 3.8% | 95.4% | 50s |
+| Pass 2 | 5s | 4,096 | 91,046 | 642 | 2,476 | 52,915 | **56.4%** | 36.2% | 2m21s |
+| **Combined** | — | — | **129,591** unique | — | — | **57,804** | **44.6%** | — | **~3.5 min** |
+
+**Key insight:** 56.4% of pass-1 timeouts are alive servers that respond in 2–5s. The two-pass approach captures them as true positives.
+
+**Combined effective OK rate: 57,804 / 129,591 = 44.6%** — vs 3.8% with pass 1 only (12× more pages).
+
+**Effective OK/s:** 57,804 ok / (50 + 141) s = **~303 OK/s avg** for the 129K-seed workload.
+
+### Why Peak RPS Jumped 10,832 vs Previous 6,116
+
+| Factor | Before | After |
+|--------|--------|-------|
+| DuckDB WAL recovery | dirty WAL from 3 SIGKILL'd runs → checkpoint → flushCh backpressure → goroutines block 10-14 min | clean DB → no checkpoint → no backpressure |
+| DNS resolver | CGO getaddrinfo (blocks OS threads, ignores context cancel) | pure Go (GODEBUG=netdns=go) |
+| Combined effect | 5,447/s peak | **10,832/s peak** |
+
+---
+
 ## Files Changed
 
 | File | Change |
@@ -236,5 +314,6 @@ _Goal is achievable; requires better seed quality, not more hardware._
 | `pkg/crawl/sysinfo_other.go` | New: non-Linux stub |
 | `pkg/crawl/autoconfig.go` | New: `AutoConfigKeepAlive` formula |
 | `pkg/crawl/keepalive.go` | Add `raiseRlimit(65536)` at top of `Run()` |
-| `cli/hn.go` | `--workers`/`--max-conns-per-domain` default → -1 (auto); inject sysinfo + GOMEMLIMIT |
-| `Makefile` | Add `seed-copy` target; fix `remote-hn-recrawl-swarm` defaults |
+| `cli/hn.go` | `--workers`/`--max-conns-per-domain` default → -1 (auto); inject sysinfo + GOMEMLIMIT; two-pass retry; failedDB closure fix |
+| `pkg/archived/recrawler/faileddb.go` | Add `LoadTimeoutURLs()` for pass 2 retry |
+| `Makefile` | Add `seed-copy` target; fix `remote-hn-recrawl-swarm` defaults; add `GODEBUG=netdns=go` to deploy wrapper |

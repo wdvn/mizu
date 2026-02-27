@@ -840,7 +840,12 @@ func runHNRecrawlV3(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("opening failed db: %w", err)
 	}
-	defer failedDB.Close()
+	failedDBDone := false
+	defer func() {
+		if !failedDBDone {
+			failedDB.Close()
+		}
+	}()
 
 	rdb, err := recrawler.NewResultDB(resultDir, 16, batchSize)
 	if err != nil {
@@ -971,6 +976,11 @@ func runHNRecrawlV3(ctx context.Context,
 	// Purpose: eliminate false negatives — servers that respond in 2–20s would be
 	// lost after pass 1's short timeout. Pass 2 gives them a fair chance.
 	if !noRetry && retryTimeoutMs > 0 && ctx.Err() == nil {
+		// DuckDB only allows one connection per file. Close pass-1 failedDB so
+		// LoadTimeoutURLs can open it read-only without a "conflicting lock" error.
+		failedDBDone = true
+		failedDB.Close()
+
 		retrySeeds, rErr := recrawler.LoadTimeoutURLs(failedDBPath)
 		if rErr != nil {
 			fmt.Printf("  %s loading timeout URLs for retry: %v\n", warningStyle.Render("warn:"), rErr)
@@ -980,6 +990,11 @@ func runHNRecrawlV3(ctx context.Context,
 				labelStyle.Render(formatInt64Exact(int64(len(retrySeeds)))),
 				retryTimeoutMs,
 			)
+
+			// Reopen failedDB for pass 2 failure writes (appends to same file).
+			// failedDB2 is nil if open fails — FailedDB methods are nil-safe.
+			failedDB2, _ := recrawler.OpenFailedDB(failedDBPath)
+			defer failedDB2.Close()
 
 			retryCfg := cfg
 			retryCfg.Timeout = time.Duration(retryTimeoutMs) * time.Millisecond
@@ -993,7 +1008,7 @@ func runHNRecrawlV3(ctx context.Context,
 			ls2 := &v3LiveStats{slowDomainMs: slowDomainMs}
 			retryCfg.Notifier = ls2
 			pw2 := &v3ProgressWriter{inner: &crawl.ResultDBWriter{DB: rdb}, ls: ls2}
-			fw2 := &v3ProgressFailureWriter{inner: &crawl.FailedDBWriter{DB: failedDB}, ls: ls2}
+			fw2 := &v3ProgressFailureWriter{inner: &crawl.FailedDBWriter{DB: failedDB2}, ls: ls2}
 
 			retryStart := time.Now()
 			retryTotal := int64(len(retrySeeds))
