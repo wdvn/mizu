@@ -1600,6 +1600,9 @@ type v3LiveStats struct {
 
 	// Optional binary writer for segment stats display (nil when not in use).
 	binWriter *crawl.BinSegWriter
+
+	// Optional hardware monitor for disk/net throughput display (nil when not in use).
+	hwmon *crawl.HWMonitor
 }
 
 // v3DomainInfo holds per-domain state for the slow-domain display.
@@ -2026,6 +2029,8 @@ func v3RenderProgress(ls *v3LiveStats, cfg crawl.Config, engineName string, seed
 	}
 	// Memory + writer telemetry
 	sb.WriteString(v3MemLine(ls.binWriter))
+	// Disk + network + channel fill
+	sb.WriteString(v3HWLine(ls.hwmon, ls.binWriter))
 	return sb.String()
 }
 
@@ -2051,6 +2056,23 @@ func v3MemLine(w *crawl.BinSegWriter) string {
 	if w != nil {
 		sb.WriteString(fmt.Sprintf("  │  Writer seg=%d pend=%d drain=%s",
 			w.SegCount(), w.PendingSegs(), ccFmtInt64(w.Drained())))
+	}
+	sb.WriteByte('\n')
+	return sb.String()
+}
+
+// v3HWLine returns a status line showing disk and network throughput (MB/s)
+// and the BinSegWriter channel fill level.  Returns "" when hwmon is nil.
+func v3HWLine(m *crawl.HWMonitor, w *crawl.BinSegWriter) string {
+	if m == nil {
+		return ""
+	}
+	s := m.Stats()
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("  HW    disk rd=%.1f wr=%.1f MB/s  │  net rx=%.1f tx=%.1f MB/s",
+		s.DiskReadMBps, s.DiskWriteMBps, s.NetRxMBps, s.NetTxMBps))
+	if w != nil {
+		sb.WriteString(fmt.Sprintf("  │  chan %.0f%%", w.ChanFill()*100))
 	}
 	sb.WriteByte('\n')
 	return sb.String()

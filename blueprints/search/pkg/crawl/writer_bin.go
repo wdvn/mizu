@@ -3,7 +3,7 @@ package crawl
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"encoding/gob"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,11 +18,11 @@ import (
 
 const (
 	// binChanCap is the number of Result records buffered in the write channel.
-	// At 10K writes/s this provides ~13 seconds of headroom before any worker blocks.
-	binChanCap = 131072 // 128K records
+	// At 10K writes/s this provides ~3.2 seconds of headroom before any worker blocks.
+	// Reduced from 128K to 32K: worst-case channel memory = 32K × avg_record ≈ 256 MB.
+	binChanCap = 32768 // 32K records
 
 	// binSegQueueCap is the number of completed segment paths buffered for the drain goroutine.
-	// 16 segments × ~16s each = ~256s of drain lag before the flusher backs up.
 	binSegQueueCap = 16
 
 	// binSegDefaultMB is the segment rotation threshold in megabytes.
@@ -32,69 +32,73 @@ const (
 	binFlushBufSize = 512 * 1024 // 512 KB
 )
 
-// binResultJSON is the JSON serialization format for NDJSON segments.
-// snake_case tags match DuckDB column names for direct read_json_auto ingestion.
-// crawled_at is stored as Unix milliseconds to avoid RFC3339 parsing ambiguity.
-type binResultJSON struct {
-	URL           string `json:"url"`
-	StatusCode    int    `json:"status_code"`
-	ContentType   string `json:"content_type"`
-	ContentLength int64  `json:"content_length"`
-	Body          string `json:"body"`
-	Title         string `json:"title"`
-	Description   string `json:"description"`
-	Language      string `json:"language"`
-	Domain        string `json:"domain"`
-	RedirectURL   string `json:"redirect_url"`
-	FetchTimeMs   int64  `json:"fetch_time_ms"`
-	CrawledAtMs   int64  `json:"crawled_at_ms"` // Unix milliseconds
-	Error         string `json:"error"`
-	Status        string `json:"status"` // "done" or "failed"
+// binRecord is the gob serialization type for binary segments (.bseg files).
+//
+// gob encodes field names once (in the type descriptor on first Encode call),
+// then uses field indices for all subsequent records — zero per-record field-name overhead.
+// Failed replaces the string "status" field: false=done, true=failed.
+type binRecord struct {
+	URL           string
+	StatusCode    int
+	ContentType   string
+	ContentLength int64
+	Body          string
+	Title         string
+	Description   string
+	Language      string
+	Domain        string
+	RedirectURL   string
+	FetchTimeMs   int64
+	CrawledAtMs   int64 // Unix milliseconds
+	Error         string
+	Failed        bool // false=done, true=failed
 }
 
-func (j *binResultJSON) toResult() recrawler.Result {
+func (r *binRecord) toResult() recrawler.Result {
 	return recrawler.Result{
-		URL:           j.URL,
-		StatusCode:    j.StatusCode,
-		ContentType:   j.ContentType,
-		ContentLength: j.ContentLength,
-		Body:          j.Body,
-		Title:         j.Title,
-		Description:   j.Description,
-		Language:      j.Language,
-		Domain:        j.Domain,
-		RedirectURL:   j.RedirectURL,
-		FetchTimeMs:   j.FetchTimeMs,
-		CrawledAt:     time.UnixMilli(j.CrawledAtMs),
-		Error:         j.Error,
+		URL:           r.URL,
+		StatusCode:    r.StatusCode,
+		ContentType:   r.ContentType,
+		ContentLength: r.ContentLength,
+		Body:          r.Body,
+		Title:         r.Title,
+		Description:   r.Description,
+		Language:      r.Language,
+		Domain:        r.Domain,
+		RedirectURL:   r.RedirectURL,
+		FetchTimeMs:   r.FetchTimeMs,
+		CrawledAt:     time.UnixMilli(r.CrawledAtMs),
+		Error:         r.Error,
 	}
 }
 
-// BinSegWriter writes results to rotating NDJSON segment files.
+// BinSegWriter writes results to rotating binary segment files (.bseg).
 //
-// Write path: HTTP workers → ch (128K buffer) → flusher goroutine → buffered file write.
+// Write path: HTTP workers → ch (32K buffer) → flusher goroutine → gob-encoded file write.
 // Drain path: completed segments → drain goroutine → rdb.Add() → DuckDB (background).
 //
-// HTTP workers are never blocked by DuckDB checkpoint pauses. The only backpressure is
-// through the 128K channel (~13s buffer at 10K/s), giving drain ~256s of lag headroom
-// before any worker blocks. Compare to the current DuckDB direct path (flushCh=2, blocks
-// immediately when checkpoint fires).
+// Key design properties:
+//   - Zero per-record heap alloc: gob.Encoder writes directly to bufio.Writer; binRecord reused.
+//   - After segment close: curBuf=nil, curEnc=nil — buffers are GC-eligible immediately.
+//   - Channel memory bounded: 32K cap × ~8KB avg record = ~256 MB worst case.
 //
 // BinSegWriter implements crawl.ResultWriter.
 type BinSegWriter struct {
-	segDir   string               // directory for NDJSON segment files
-	maxBytes int64                // rotate segment when it reaches this size
-	rdb      *recrawler.ResultDB  // drain destination (nil = no drain, segments left on disk)
+	segDir   string              // directory for binary segment files
+	maxBytes int64               // rotate segment when it reaches this size
+	rdb      *recrawler.ResultDB // drain destination (nil = no drain, segments left on disk)
 
-	ch    chan recrawler.Result // primary write channel, large buffer
+	ch    chan recrawler.Result // primary write channel, buffered
 	segCh chan string           // completed segment paths for drain goroutine
 
-	// flusher state — accessed only by the flusher goroutine, no lock needed
+	// flusher state — accessed only by the flusher goroutine, no lock needed.
 	cur      *os.File
 	curBuf   *bufio.Writer
+	curEnc   *gob.Encoder // one encoder per segment; nil when no segment is open
 	curBytes int64
 	curPath  string
 	segNum   int
+	jr       binRecord // reused record buffer; avoids a binRecord allocation per writeOne call
 
 	written  atomic.Int64 // records written to segment files
 	drained  atomic.Int64 // records successfully drained to DuckDB
@@ -128,7 +132,7 @@ func NewBinSegWriter(segDir string, maxMB int, rdb *recrawler.ResultDB) (*BinSeg
 	return w, nil
 }
 
-// Add enqueues a result for writing. It blocks only when the 128K channel is full
+// Add enqueues a result for writing. It blocks only when the 32K channel is full
 // (which only occurs if the flusher goroutine cannot keep up with disk writes).
 // Under normal operation this channel stays near-empty.
 func (w *BinSegWriter) Add(r recrawler.Result) {
@@ -159,9 +163,19 @@ func (w *BinSegWriter) PendingSegs() int32 { return w.pendSeg.Load() }
 // SegCount returns the total number of segment files created.
 func (w *BinSegWriter) SegCount() int32 { return w.segCount.Load() }
 
+// ChanFill returns the fractional fill level of the write channel [0.0, 1.0].
+// Values near 1.0 indicate the flusher cannot keep up (disk I/O bottleneck).
+func (w *BinSegWriter) ChanFill() float64 {
+	c := cap(w.ch)
+	if c == 0 {
+		return 0
+	}
+	return float64(len(w.ch)) / float64(c)
+}
+
 // ── flusher ──────────────────────────────────────────────────────────────────
 
-// flusher drains w.ch, serializes each Result as a JSON line, and writes to
+// flusher drains w.ch, encodes each Result as a gob record, and writes to
 // the current segment file. When the segment reaches maxBytes, it's closed and
 // its path sent to segCh for the drain goroutine.
 func (w *BinSegWriter) flusher() {
@@ -184,33 +198,37 @@ func (w *BinSegWriter) writeOne(r recrawler.Result) {
 		}
 	}
 
-	status := "done"
-	if r.Error != "" {
-		status = "failed"
-	}
-	jr := binResultJSON{
-		URL:           binSanitize(r.URL),
-		StatusCode:    r.StatusCode,
-		ContentType:   binSanitize(r.ContentType),
-		ContentLength: r.ContentLength,
-		Body:          binSanitize(r.Body),
-		Title:         binSanitize(r.Title),
-		Description:   binSanitize(r.Description),
-		Language:      binSanitize(r.Language),
-		Domain:        binSanitize(r.Domain),
-		RedirectURL:   binSanitize(r.RedirectURL),
-		FetchTimeMs:   r.FetchTimeMs,
-		CrawledAtMs:   r.CrawledAt.UnixMilli(),
-		Error:         binSanitize(r.Error),
-		Status:        status,
-	}
-	b, err := json.Marshal(jr)
-	if err != nil {
+	// Reuse w.jr to avoid a binRecord allocation per record.
+	jr := &w.jr
+	jr.URL           = binSanitize(r.URL)
+	jr.StatusCode    = r.StatusCode
+	jr.ContentType   = binSanitize(r.ContentType)
+	jr.ContentLength = r.ContentLength
+	jr.Body          = binSanitize(r.Body)
+	jr.Title         = binSanitize(r.Title)
+	jr.Description   = binSanitize(r.Description)
+	jr.Language      = binSanitize(r.Language)
+	jr.Domain        = binSanitize(r.Domain)
+	jr.RedirectURL   = binSanitize(r.RedirectURL)
+	jr.FetchTimeMs   = r.FetchTimeMs
+	jr.CrawledAtMs   = r.CrawledAt.UnixMilli()
+	jr.Error         = binSanitize(r.Error)
+	jr.Failed        = r.Error != ""
+
+	// Track bytes written to the bufio buffer for segment rotation.
+	// b0/b1 are bytes currently in the buffer before/after Encode.
+	// If b1 < b0, bufio auto-flushed during Encode; adjust accordingly.
+	b0 := w.curBuf.Buffered()
+	if err := w.curEnc.Encode(jr); err != nil {
 		return
 	}
-	b = append(b, '\n')
-	n, _ := w.curBuf.Write(b)
-	w.curBytes += int64(n)
+	b1 := w.curBuf.Buffered()
+	if b1 >= b0 {
+		w.curBytes += int64(b1 - b0)
+	} else {
+		// bufio flushed between b0 and b1; full flush of b0 bytes + new b1 bytes
+		w.curBytes += int64(w.curBuf.Size()-b0) + int64(b1)
+	}
 	w.written.Add(1)
 }
 
@@ -218,7 +236,7 @@ func (w *BinSegWriter) writeOne(r recrawler.Result) {
 func (w *BinSegWriter) rotateSeg() {
 	w.closeCurrentSeg()
 	w.segNum++
-	path := filepath.Join(w.segDir, fmt.Sprintf("seg_%06d.jsonl", w.segNum))
+	path := filepath.Join(w.segDir, fmt.Sprintf("seg_%06d.bseg", w.segNum))
 	f, err := os.Create(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[binwriter] failed to create segment %s: %v\n", path, err)
@@ -227,6 +245,7 @@ func (w *BinSegWriter) rotateSeg() {
 	}
 	w.cur = f
 	w.curBuf = bufio.NewWriterSize(f, binFlushBufSize)
+	w.curEnc = gob.NewEncoder(w.curBuf) // encoder writes directly to bufio, no intermediate alloc
 	w.curBytes = 0
 	w.curPath = path
 	w.segCount.Add(1)
@@ -243,6 +262,7 @@ func (w *BinSegWriter) closeCurrentSeg() {
 	path := w.curPath
 	w.cur = nil
 	w.curBuf = nil
+	w.curEnc = nil // release gob encoder's internal buffer (GC-eligible immediately)
 
 	if w.curBytes > 0 {
 		w.pendSeg.Add(1)
@@ -264,8 +284,8 @@ func (w *BinSegWriter) drainer() {
 	}
 }
 
-// drainSeg reads a NDJSON segment file, calls rdb.Add for each record, then deletes
-// the file. Returns the number of records successfully decoded.
+// drainSeg reads a binary segment file (.bseg), calls rdb.Add for each record, then
+// deletes the file. Returns the number of records successfully decoded.
 func (w *BinSegWriter) drainSeg(path string) int64 {
 	defer os.Remove(path) // always delete — even on partial read
 
@@ -280,14 +300,14 @@ func (w *BinSegWriter) drainSeg(path string) int64 {
 	}
 	defer f.Close()
 
-	dec := json.NewDecoder(f)
+	dec := gob.NewDecoder(f)
+	var rec binRecord
 	var count int64
 	for {
-		var jr binResultJSON
-		if err := dec.Decode(&jr); err != nil {
+		if err := dec.Decode(&rec); err != nil {
 			break // EOF or corrupt record
 		}
-		w.rdb.Add(jr.toResult())
+		w.rdb.Add(rec.toResult())
 		count++
 	}
 

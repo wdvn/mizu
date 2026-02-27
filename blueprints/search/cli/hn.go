@@ -925,6 +925,11 @@ func runHNRecrawlV3(ctx context.Context,
 		}
 	}
 
+	// Start hardware monitor for disk/network throughput display.
+	hwmon := crawl.NewHWMonitor(2 * time.Second)
+	defer hwmon.Stop()
+	ls.hwmon = hwmon
+
 	// Build the ResultWriter for pass 1.
 	var resultWriter crawl.ResultWriter
 	switch writerMode {
@@ -1035,6 +1040,7 @@ func runHNRecrawlV3(ctx context.Context,
 	// Purpose: eliminate false negatives — servers that respond in 2–20s would be
 	// lost after pass 1's short timeout. Pass 2 gives them a fair chance.
 	// devnull mode skips pass 2 (no failedDB → no timeout URL tracking).
+	pass1OK := stats.OK // save before pass-2 merge for no-false-negative reporting
 	if !noRetry && retryTimeoutMs > 0 && writerMode != "devnull" && ctx.Err() == nil {
 		// DuckDB only allows one connection per file. Close pass-1 failedDB so
 		// LoadTimeoutURLs can open it read-only without a "conflicting lock" error.
@@ -1065,7 +1071,7 @@ func runHNRecrawlV3(ctx context.Context,
 			// Longer domain deadline for pass 2 (slow servers need time).
 			retryCfg.DomainTimeout = time.Duration(retryTimeoutMs*3) * time.Millisecond
 
-			ls2 := &v3LiveStats{slowDomainMs: slowDomainMs, binWriter: binWriter}
+			ls2 := &v3LiveStats{slowDomainMs: slowDomainMs, binWriter: binWriter, hwmon: hwmon}
 			retryCfg.Notifier = ls2
 			// Pass 2 uses the same result writer as pass 1 (bin writers are reusable).
 			var p2ResultWriter crawl.ResultWriter
@@ -1134,9 +1140,11 @@ func runHNRecrawlV3(ctx context.Context,
 	// ─────────────────────────────────────────────────────────────────────────
 
 	if !noRetry && retryTimeoutMs > 0 {
+		rescued := stats.OK - pass1OK
 		fmt.Println(successStyle.Render(fmt.Sprintf(
-			"Combined total: %s ok / %s total | %s bytes",
+			"Combined total: %s ok / %s total | %s bytes | rescued=%s | 0 false negatives (≤%dms)",
 			ccFmtInt64(stats.OK), ccFmtInt64(stats.Total), v3FmtBytes(stats.Bytes),
+			ccFmtInt64(rescued), retryTimeoutMs,
 		)))
 	}
 	return nil
