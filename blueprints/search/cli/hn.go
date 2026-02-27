@@ -787,6 +787,9 @@ func runHNRecrawlV3(ctx context.Context,
 	if err := os.MkdirAll(resultDir, 0o755); err != nil {
 		return fmt.Errorf("create result dir: %w", err)
 	}
+	cfg.SwarmResultDir = resultDir
+	cfg.SwarmFailedDir = hnCfg.WithDefaults().RecrawlDir()
+	cfg.BatchSize = batchSize
 
 	failedDB, err := recrawler.OpenFailedDB(failedDBPath)
 	if err != nil {
