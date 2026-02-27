@@ -181,6 +181,11 @@ func RunDrone(ctx context.Context, cfg Config) error {
 
 	dns := &staticFrameCache{resolved: frame.Resolved, dead: frame.Dead}
 
+	// Raise fd limit so we can have thousands of concurrent sockets.
+	if err := raiseRlimit(65536); err != nil {
+		fmt.Fprintf(os.Stderr, "[drone] raiseRlimit: %v (continuing)\n", err)
+	}
+
 	// Open result DB.
 	if cfg.SwarmResultDir == "" {
 		return fmt.Errorf("--result-dir is required for drone")
