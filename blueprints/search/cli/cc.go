@@ -1831,6 +1831,9 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	if selfBin, execErr := os.Executable(); execErr == nil {
 		cfg.SearchBinary = selfBin
 	}
+	cfg.SwarmResultDir = resultDir
+	cfg.SwarmFailedDir = filepath.Dir(failedDBPath)
+	cfg.BatchSize = opts.batchSize
 
 	var dnsCache crawl.DNSCache
 	if dnsResolver != nil {
