@@ -2160,20 +2160,50 @@ func v3FmtDur(d time.Duration) string {
 // newCCRecrawlDrone is the hidden subcommand spawned by SwarmEngine queen processes.
 // It reads seed URLs as JSON lines from stdin and crawls them using KeepAliveEngine.
 func newCCRecrawlDrone() *cobra.Command {
-	var droneID int
+	var (
+		droneID             int
+		workers             int
+		timeoutMs           int
+		maxConnsPerDomain   int
+		statusOnly          bool
+		batchSize           int
+		resultDir           string
+		failedDB            string
+		domainFailThreshold int
+		domainTimeoutMs     int
+	)
 	cmd := &cobra.Command{
 		Use:    "recrawl-drone",
 		Hidden: true,
 		Short:  "Internal: drone worker for swarm engine",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			_ = droneID
 			cfg := crawl.DefaultConfig()
-			cfg.Workers = 500
-			cfg.StatusOnly = true
+			cfg.Workers = workers
+			cfg.Timeout = time.Duration(timeoutMs) * time.Millisecond
+			cfg.MaxConnsPerDomain = maxConnsPerDomain
+			cfg.StatusOnly = statusOnly
 			cfg.InsecureTLS = true
+			cfg.BatchSize = batchSize
+			cfg.SwarmResultDir = resultDir
+			cfg.SwarmFailedDB = failedDB
+			cfg.DomainFailThreshold = domainFailThreshold
+			if domainTimeoutMs > 0 {
+				cfg.DomainTimeout = time.Duration(domainTimeoutMs) * time.Millisecond
+			}
 			return crawl.RunDrone(cmd.Context(), cfg)
 		},
 	}
 	cmd.Flags().IntVar(&droneID, "drone-id", 0, "Drone index (used for log prefix)")
+	cmd.Flags().IntVar(&workers, "workers", 500, "Fetch worker count")
+	cmd.Flags().IntVar(&timeoutMs, "timeout", 5000, "Per-request timeout (ms)")
+	cmd.Flags().IntVar(&maxConnsPerDomain, "max-conns-per-domain", 4, "Max conns per domain")
+	cmd.Flags().BoolVar(&statusOnly, "status-only", false, "Status-only mode (discard body)")
+	cmd.Flags().IntVar(&batchSize, "batch-size", 5000, "DB write batch size")
+	cmd.Flags().StringVar(&resultDir, "result-dir", "", "Result DB directory (required)")
+	cmd.Flags().StringVar(&failedDB, "failed-db", "", "Failed URL DB path")
+	cmd.Flags().IntVar(&domainFailThreshold, "domain-fail-threshold", 3, "Domain abandonment threshold")
+	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", 0, "Per-domain timeout ms (0=disabled)")
 	return cmd
 }
 
