@@ -1361,7 +1361,7 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 	failedDB.SetMeta("started_at", time.Now().Format(time.RFC3339))
 	fmt.Println(successStyle.Render(fmt.Sprintf("  FailedDB → %s", failedDBPath)))
 
-	rdb, err := recrawler.NewResultDB(resultDir, 16, opts.batchSize)
+	rdb, err := recrawler.NewResultDB(resultDir, 8, opts.batchSize)
 	if err != nil {
 		return fmt.Errorf("opening result db: %w", err)
 	}
@@ -1370,7 +1370,7 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 			_ = rdb.Close()
 		}
 	}()
-	fmt.Println(successStyle.Render(fmt.Sprintf("  Results → %s/ (16 shards)", resultDir)))
+	fmt.Println(successStyle.Render(fmt.Sprintf("  Results → %s/ (8 shards)", resultDir)))
 
 	rdb.SetMeta(ctx, "crawl_id", opts.crawlID)
 	rdb.SetMeta(ctx, "seed_source", "cc-index")
@@ -1772,7 +1772,7 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	}
 	defer failedDB.Close()
 
-	rdb, err := recrawler.NewResultDB(resultDir, 16, opts.batchSize)
+	rdb, err := recrawler.NewResultDB(resultDir, 8, opts.batchSize)
 	if err != nil {
 		return fmt.Errorf("opening result db: %w", err)
 	}
@@ -1801,7 +1801,7 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 	fmt.Printf("  TLS               skip-verify\n")
 	fmt.Printf("  Seeds             %s URLs\n", ccFmtInt64(int64(len(seeds))))
 	fmt.Printf("  FailedDB          %s\n", failedDBPath)
-	fmt.Printf("  Results           %s/ (16 shards)\n\n", resultDir)
+	fmt.Printf("  Results           %s/ (8 shards)\n\n", resultDir)
 
 	ls := &v3LiveStats{slowDomainMs: 30_000}
 	cfg.Notifier = ls

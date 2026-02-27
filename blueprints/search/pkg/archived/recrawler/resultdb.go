@@ -65,7 +65,7 @@ func NewResultDB(dir string, shardCount, batchSize int) (*ResultDB, error) {
 		s := &resultShard{
 			db:      db,
 			batchSz: batchSize,
-			flushCh: make(chan []Result, 2),
+			flushCh: make(chan []Result, 256),
 			done:    make(chan struct{}),
 		}
 
@@ -91,11 +91,18 @@ func (rdb *ResultDB) closeOpenShards(n int) {
 }
 
 func initResultSchema(db *sql.DB) error {
-	// Cap DuckDB buffer pool at 128 MB per shard (16 shards × 128 MB = 2 GB total).
-	// Without this, DuckDB aggressively buffers body data and exhausts server RAM.
-	// DuckDB spills excess pages to a temp file, so this does not affect correctness.
-	if _, err := db.Exec("SET memory_limit='128MB'"); err != nil {
+	// Cap DuckDB buffer pool at 96 MB per shard (16 shards × 96 MB ≈ 1.5 GB total).
+	// 64 MB is too small: "failed to pin block" errors occur during large body INSERTs.
+	// 128 MB is too large: OOM kills the process on a 5.9 GB server (Go 2 GB + DuckDB 2 GB).
+	// DuckDB spills excess pages to a temp file, so this limit does not affect correctness.
+	if _, err := db.Exec("SET memory_limit='96MB'"); err != nil {
 		return fmt.Errorf("set memory_limit: %w", err)
+	}
+	// Force temp spill files to real disk (/tmp on /dev/sda3).
+	// Without this, DuckDB may default to /dev/shm (an unbounded tmpfs / RAM-backed
+	// filesystem) and effectively double its memory footprint when spilling pages.
+	if _, err := db.Exec("SET temp_directory='/tmp'"); err != nil {
+		return fmt.Errorf("set temp_directory: %w", err)
 	}
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS results (

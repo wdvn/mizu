@@ -684,7 +684,7 @@ and adaptive timeouts.`,
 	cmd.Flags().IntVar(&dnsWorkers, "dns-workers", 1000, "Concurrent DNS workers (0=skip DNS pre-resolution)")
 	cmd.Flags().IntVar(&dnsTimeoutMs, "dns-timeout", 1500, "DNS lookup timeout in milliseconds")
 
-	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 20000, "Pass-2 timeout for retrying http_timeout URLs (ms); 0=disabled")
+	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 5000, "Pass-2 timeout for retrying http_timeout URLs (ms); 0=disabled")
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs (faster; may miss slow-but-live servers)")
 	return cmd
 }
@@ -983,8 +983,8 @@ func runHNRecrawlV3(ctx context.Context,
 
 			retryCfg := cfg
 			retryCfg.Timeout = time.Duration(retryTimeoutMs) * time.Millisecond
-			// Quarter the workers for pass 2 — slow domains need fewer concurrent connections.
-			retryCfg.Workers = max(workers/4, 200)
+			// Half the workers for pass 2 — slow domains need more time but we still want throughput.
+			retryCfg.Workers = max(workers/2, 200)
 			// Be more lenient: don't abandon domains early in pass 2 (they might just be slow).
 			retryCfg.DomainFailThreshold = 1
 			// Longer domain deadline for pass 2 (slow servers need time).
