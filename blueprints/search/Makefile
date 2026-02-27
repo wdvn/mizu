@@ -7,6 +7,8 @@ BINARY  ?= $(HOME)/bin/search
 LINUX_BINARY ?= $(HOME)/bin/search-linux
 LINUX_RUNTIME_LIB_DIR ?= $(HOME)/bin/search-linux-libs-focal-gcc11
 LINUX_RUNTIME_LIBSTDCPP ?= $(LINUX_RUNTIME_LIB_DIR)/libstdc++.so.6
+# Noble (Ubuntu 24.04) build — no bundled libstdc++ needed (system ships it)
+LINUX_BINARY_NOBLE ?= $(HOME)/bin/search-linux-noble
 CMD     ?= ./cmd/search
 DATA_DIR ?= $(HOME)/data/blueprint/search
 DEPLOY_KEY    ?= $(HOME)/.ssh/id_ed25519_deploy
@@ -23,10 +25,14 @@ SSH           ?= ssh -i $(DEPLOY_KEY) -o BatchMode=yes
 SCP           ?= scp -i $(DEPLOY_KEY)
 
 CGO_ENABLED ?= 1
+# Focal (Ubuntu 20.04) build vars — max compatibility (glibc 2.31)
 LINUX_BASE_IMAGE ?= ubuntu:20.04
 LINUX_GO_VERSION ?= 1.26.0
 LINUX_GOARCH ?= amd64
-LINUX_DOCKERFILE ?= Dockerfile.linux
+LINUX_DOCKERFILE ?= Dockerfile.linux-focal
+# Noble (Ubuntu 24.04) build vars — for Ubuntu 24.04 servers (glibc 2.39)
+LINUX_NOBLE_DOCKERFILE ?= Dockerfile.linux-noble
+LINUX_NOBLE_IMAGE_TAG ?= mizu-search-linux-noble-build:local
 LINUX_BUILD_CONTEXT ?= $(abspath ../..)
 LINUX_IGNOREFILE ?= $(LINUX_DOCKERFILE).dockerignore
 LINUX_CONTAINER ?= podman
@@ -113,6 +119,58 @@ build-linux: ## Build Ubuntu/Linux binary to $$HOME/bin/search-linux (Docker, CG
 		$(LINUX_CONTAINER) cp "$$cid:/search-linux" "$$tmp_out/search-linux"; \
 		install -m 0755 "$$tmp_out/search-linux" "$(LINUX_BINARY)"
 	@echo "Built Linux binary: $(LINUX_BINARY) ($(VERSION))"
+
+.PHONY: build-linux-noble
+build-linux-noble: ## Build Ubuntu 24.04 (Noble) binary to $$HOME/bin/search-linux-noble (Docker, CGO enabled)
+	@mkdir -p $(dir $(LINUX_BINARY_NOBLE))
+	@tmp_out="$$(mktemp -d)"; \
+		img="$(LINUX_NOBLE_IMAGE_TAG)"; \
+		cid=""; \
+		set -e; \
+		trap 'test -n "$$cid" && $(LINUX_CONTAINER) rm -f "$$cid" >/dev/null 2>&1 || true; rm -rf "$$tmp_out"' EXIT; \
+		command -v "$(LINUX_CONTAINER)" >/dev/null 2>&1 || { echo "$(LINUX_CONTAINER) not found"; exit 127; }; \
+		if [ "$(LINUX_CONTAINER)" = "podman" ]; then \
+			if ! podman machine inspect >/dev/null 2>&1; then \
+				echo "Initializing podman machine..."; \
+				podman machine init; \
+			fi; \
+			if ! podman info >/dev/null 2>&1; then \
+				echo "Starting podman machine..."; \
+				podman machine start >/dev/null; \
+			fi; \
+			for i in $$(seq 1 30); do \
+				podman info >/dev/null 2>&1 && break; \
+				sleep 1; \
+			done; \
+			podman info >/dev/null 2>&1 || { echo "podman not ready"; exit 1; }; \
+		fi; \
+		$(LINUX_CONTAINER) build \
+			--layers \
+			--platform "linux/$(LINUX_GOARCH)" \
+			--file "$(LINUX_NOBLE_DOCKERFILE)" \
+			--ignorefile "$(LINUX_DOCKERFILE).dockerignore" \
+			--build-arg GO_VERSION="$(LINUX_GO_VERSION)" \
+			--build-arg TARGETARCH="$(LINUX_GOARCH)" \
+			--build-arg GO_LDFLAGS="$(GO_LDFLAGS)" \
+			--target artifact \
+			-t "$$img" \
+			"$(LINUX_BUILD_CONTEXT)"; \
+		cid="$$($(LINUX_CONTAINER) create --platform "linux/$(LINUX_GOARCH)" "$$img")"; \
+		$(LINUX_CONTAINER) cp "$$cid:/search-linux-noble" "$$tmp_out/search-linux-noble"; \
+		install -m 0755 "$$tmp_out/search-linux-noble" "$(LINUX_BINARY_NOBLE)"
+	@echo "Built Noble binary: $(LINUX_BINARY_NOBLE) ($(VERSION))"
+
+.PHONY: deploy-linux-noble
+deploy-linux-noble: build-linux-noble ## Deploy Ubuntu 24.04 binary to remote $$HOME/bin/search (no bundled libstdc++)
+	@test -f "$(DEPLOY_KEY)" || { echo "Deploy key not found: $(DEPLOY_KEY)"; exit 1; }
+	@$(SSH) $(REMOTE_SSH) "mkdir -p \$$HOME/bin"
+	@$(SCP) "$(LINUX_BINARY_NOBLE)" $(REMOTE_SSH):.search-upload.tmp
+	@$(SSH) $(REMOTE_SSH) 'bash -lc "set -e; \
+		install -m 0755 $$HOME/.search-upload.tmp $$HOME/bin/search-linux-noble; \
+		rm -f $$HOME/.search-upload.tmp; \
+		printf '"'"'#!/usr/bin/env bash\nulimit -n 65536 2>/dev/null || true\nexport GOMEMLIMIT=2000000000\nexport GODEBUG=netdns=go\nexec \"$$HOME/bin/search-linux-noble\" \"\$$@\"\n'"'"' > $$HOME/bin/search; \
+		chmod +x $$HOME/bin/search"'
+	@echo "Deployed Noble: $(REMOTE_SSH):~/bin/search"
 
 .PHONY: deploy-linux
 deploy-linux: build-linux ## Deploy linux binary to remote $$HOME/bin/search

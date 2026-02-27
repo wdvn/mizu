@@ -92,10 +92,9 @@ func (rdb *ResultDB) closeOpenShards(n int) {
 
 func initResultSchema(db *sql.DB) error {
 	// Cap DuckDB buffer pool at 256 MB per shard (8 shards × 256 MB = 2 GB total).
-	// '128MB' (decimal) = 122 MiB; DuckDB fills to 99.8% = 121.8 MiB, leaving only 270 KB.
-	// Checkpoint needs 256-260 KB → intermittent failures rolling back uncommitted WAL data.
-	// '256MB' = 244 MiB; at 99.8% fill = 243.5 MiB, headroom = 0.5 MiB >> 260 KB needed.
-	// We also CHECKPOINT after every batch (see flusher) to prevent pool from filling.
+	// '256MB' (decimal) = 244 MiB. Combined with checkpoint_threshold='4MB' below,
+	// auto-checkpoints fire every 4 MB of WAL, keeping dirty pages << pool size so
+	// LRU eviction succeeds when checkpoint pins a new 256 KB block.
 	// Peak RSS with 8 shards: ~3.4 GB (well within 5.8 GB server limit).
 	if _, err := db.Exec("SET memory_limit='256MB'"); err != nil {
 		return fmt.Errorf("set memory_limit: %w", err)
@@ -111,6 +110,15 @@ func initResultSchema(db *sql.DB) error {
 	// (DuckDB official suggestion for OOM scenarios).
 	if _, err := db.Exec("SET preserve_insertion_order=false"); err != nil {
 		return fmt.Errorf("set preserve_insertion_order: %w", err)
+	}
+	// Trigger auto-checkpoint every 4 MB of WAL data (default is ~16 MiB).
+	// At 4 MB dirty pages, 240 MB of the 244 MiB pool is clean → LRU eviction
+	// succeeds when checkpoint needs to pin a new 256 KB block.
+	// Without this, 16 MB dirty pages accumulate before checkpoint, and at
+	// pool 99.94% full, DuckDB fails "failed to pin block of size 256 KiB".
+	// Note: calling CHECKPOINT explicitly from Go causes DuckDB SIGSEGV.
+	if _, err := db.Exec("SET checkpoint_threshold='4MB'"); err != nil {
+		fmt.Fprintf(os.Stderr, "[resultdb] SET checkpoint_threshold: %v (continuing with default)\n", err)
 	}
 	// No PRIMARY KEY: avoids ART index I/O on every INSERT (which keeps index pages
 	// resident in RSS, causing OOM on the 5.9 GB server). Fresh crawl runs have
@@ -179,21 +187,9 @@ func (rdb *ResultDB) Flush(_ context.Context) error {
 
 func (s *resultShard) flusher(flushed *atomic.Int64) {
 	defer close(s.done)
-	var batchN int
 	for batch := range s.flushCh {
 		n := writeBatchValues(s.db, batch)
 		flushed.Add(int64(n))
-		// Checkpoint every 10 batches (100 rows) to prevent buffer-pool overflow.
-		// DuckDB fills the pool to 99.94% of its limit (all pages dirty/clean).
-		// When pool is full, new checkpoint pins fail: "failed to pin 256 KiB (244/244 MiB)".
-		// Every 10 batches = ≤25.6 MB dirty pages (10% of 244 MiB pool), leaving
-		// 90% clean pages for LRU eviction so the checkpoint pin succeeds.
-		// Performance impact: ~17% overhead (≈ 1,600 checkpoints × 37 ms each).
-		batchN++
-		if batchN >= 10 {
-			batchN = 0
-			s.db.Exec("CHECKPOINT") //nolint:errcheck
-		}
 	}
 }
 

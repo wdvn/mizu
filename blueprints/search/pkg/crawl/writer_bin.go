@@ -275,8 +275,16 @@ func (w *BinSegWriter) closeCurrentSeg() {
 
 // drainer reads completed segment paths from segCh and drains each one into the
 // destination ResultDB. Segment files are deleted after successful drain.
+// rdb.Flush is called once after all segments are drained to amortize DuckDB overhead.
+// Calling Flush per-segment (inside drainSeg) caused ~16s blocking per segment across
+// 16 shards, back-pressuring the flusher and filling the worker channel to 100%.
 func (w *BinSegWriter) drainer() {
-	defer w.wg.Done()
+	defer func() {
+		if w.rdb != nil {
+			w.rdb.Flush(context.Background())
+		}
+		w.wg.Done()
+	}()
 	for segPath := range w.segCh {
 		count := w.drainSeg(segPath)
 		w.drained.Add(count)
@@ -310,9 +318,6 @@ func (w *BinSegWriter) drainSeg(path string) int64 {
 		w.rdb.Add(rec.toResult())
 		count++
 	}
-
-	// Flush any accumulated batch in the ResultDB shards for this segment.
-	w.rdb.Flush(context.Background())
 	return count
 }
 
