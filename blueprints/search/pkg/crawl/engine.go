@@ -52,10 +52,8 @@ type Config struct {
 	SwarmFailedDir string // base dir; drone i writes to SwarmFailedDir/failed_{i}.duckdb
 
 	// Swarm drone – set from --result-dir / --failed-db CLI flags.
-	SwarmFailedDB string // this drone's failed DB path
-
-	// DB write batch size (used by swarm drones when creating ResultDB).
-	BatchSize int
+	SwarmFailedDB string // this drone's failed DB path (e.g. SwarmFailedDir/failed_0.duckdb)
+	BatchSize     int    // DB write batch size for ResultDB
 }
 
 // DomainNotifier receives domain lifecycle events from the engine.
