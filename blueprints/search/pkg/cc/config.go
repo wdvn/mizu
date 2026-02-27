@@ -73,6 +73,11 @@ func (c Config) WARCDir() string {
 	return filepath.Join(c.CrawlDir(), "warc")
 }
 
+// WARCImportDir returns the directory for WARC import result databases.
+func (c Config) WARCImportDir() string {
+	return filepath.Join(c.CrawlDir(), "warc-import")
+}
+
 // RecrawlDir returns the directory for recrawl result shard files.
 // Separate from ResultDir (WARC fetch results) to avoid confusion.
 func (c Config) RecrawlDir() string {

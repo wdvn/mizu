@@ -44,7 +44,7 @@ Subcommands:
   query    Query index for matching URLs (local or remote)
   fetch    High-throughput page extraction from WARC files
   recrawl  CC index → URL extraction → recrawl from origin servers
-  warc     Fetch and display a single WARC record
+  warc     Work with WARC files (get/list/download/extract/import/query)
   url      Lookup a URL via CDX API
 
 `,
@@ -58,7 +58,8 @@ Subcommands:
   search cc query --remote --domain example.com --limit 10
   search cc fetch --remote --domain example.com --limit 100
   search cc recrawl --file 0 --status-only --limit 1000
-  search cc warc --file crawl-data/CC-MAIN-2026-08/... --offset 12345 --length 6789
+  search cc warc list
+  search cc warc get --file crawl-data/CC-MAIN-2026-08/... --offset 12345 --length 6789
   search cc url --url https://example.com`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return cmd.Help()
@@ -71,7 +72,7 @@ Subcommands:
 	cmd.AddCommand(newCCStats())
 	cmd.AddCommand(newCCQuery())
 	cmd.AddCommand(newCCFetch())
-	cmd.AddCommand(newCCWarc())
+	cmd.AddCommand(newCCWarcParent())
 	cmd.AddCommand(newCCURL())
 	cmd.AddCommand(newCCRecrawl())
 	cmd.AddCommand(newCCRecrawlDrone())
@@ -760,83 +761,6 @@ func runCCFetch(ctx context.Context, crawlID, lang, mime string, status int, dom
 	fmt.Println()
 
 	return err
-}
-
-// ── cc warc ──────────────────────────────────────────────
-
-func newCCWarc() *cobra.Command {
-	var (
-		file   string
-		offset int64
-		length int64
-	)
-
-	cmd := &cobra.Command{
-		Use:   "warc",
-		Short: "Fetch and display a single WARC record",
-		Long: `Fetch and display a single WARC record by byte range.
-
-Use this when you already have a WARC filename + offset + length from ` + "`cc query`" + ` or ` + "`cc url`" + `.`,
-		Example: `  search cc warc --file crawl-data/CC-MAIN-2026-08/segments/.../warc/CC-MAIN-....warc.gz --offset 12345 --length 6789`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runCCWarc(cmd.Context(), file, offset, length)
-		},
-	}
-
-	cmd.Flags().StringVar(&file, "file", "", "WARC file path (relative to CC base URL)")
-	cmd.Flags().Int64Var(&offset, "offset", 0, "Byte offset")
-	cmd.Flags().Int64Var(&length, "length", 0, "Byte length")
-	cmd.MarkFlagRequired("file")
-	cmd.MarkFlagRequired("offset")
-	cmd.MarkFlagRequired("length")
-
-	return cmd
-}
-
-func runCCWarc(ctx context.Context, file string, offset, length int64) error {
-	client := cc.NewClient("", 4)
-
-	ptr := cc.WARCPointer{
-		WARCFilename: file,
-		RecordOffset: offset,
-		RecordLength: length,
-	}
-
-	fmt.Println(infoStyle.Render(fmt.Sprintf("Fetching WARC record from %s [%d-%d]...", file, offset, offset+length-1)))
-
-	data, err := client.FetchWARCRecord(ctx, 0, ptr)
-	if err != nil {
-		return fmt.Errorf("fetching record: %w", err)
-	}
-
-	resp, err := cc.ParseWARCRecord(data)
-	if err != nil {
-		return fmt.Errorf("parsing record: %w", err)
-	}
-
-	fmt.Println()
-	fmt.Println(successStyle.Render("WARC Record:"))
-	fmt.Printf("  Type:        %s\n", resp.WARCType)
-	fmt.Printf("  Target URI:  %s\n", resp.TargetURI)
-	fmt.Printf("  Date:        %s\n", resp.Date.Format(time.RFC3339))
-	fmt.Printf("  Record ID:   %s\n", resp.RecordID)
-	fmt.Printf("  HTTP Status: %d\n", resp.HTTPStatus)
-
-	fmt.Println()
-	fmt.Println(infoStyle.Render("HTTP Headers:"))
-	for k, v := range resp.HTTPHeaders {
-		fmt.Printf("  %s: %s\n", k, v)
-	}
-
-	fmt.Println()
-	fmt.Printf("  %s\n", infoStyle.Render(fmt.Sprintf("Body (%d bytes):", len(resp.Body))))
-	body := string(resp.Body)
-	if len(body) > 2000 {
-		body = body[:2000] + "\n... (truncated)"
-	}
-	fmt.Println(body)
-
-	return nil
 }
 
 // ── cc url ──────────────────────────────────────────────
