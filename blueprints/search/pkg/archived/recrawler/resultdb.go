@@ -65,7 +65,7 @@ func NewResultDB(dir string, shardCount, batchSize int) (*ResultDB, error) {
 		s := &resultShard{
 			db:      db,
 			batchSz: batchSize,
-			flushCh: make(chan []Result, 256),
+			flushCh: make(chan []Result, 2), // back-pressure: prevents unbounded body accumulation
 			done:    make(chan struct{}),
 		}
 
@@ -91,22 +91,31 @@ func (rdb *ResultDB) closeOpenShards(n int) {
 }
 
 func initResultSchema(db *sql.DB) error {
-	// Cap DuckDB buffer pool at 96 MB per shard (16 shards × 96 MB ≈ 1.5 GB total).
+	// Cap DuckDB buffer pool at 96 MB per shard (8 shards × 96 MB = 768 MB total).
 	// 64 MB is too small: "failed to pin block" errors occur during large body INSERTs.
 	// 128 MB is too large: OOM kills the process on a 5.9 GB server (Go 2 GB + DuckDB 2 GB).
 	// DuckDB spills excess pages to a temp file, so this limit does not affect correctness.
 	if _, err := db.Exec("SET memory_limit='96MB'"); err != nil {
 		return fmt.Errorf("set memory_limit: %w", err)
 	}
-	// Force temp spill files to real disk (/tmp on /dev/sda3).
-	// Without this, DuckDB may default to /dev/shm (an unbounded tmpfs / RAM-backed
-	// filesystem) and effectively double its memory footprint when spilling pages.
-	if _, err := db.Exec("SET temp_directory='/tmp'"); err != nil {
-		return fmt.Errorf("set temp_directory: %w", err)
+	// Limit DuckDB to 1 thread per shard (default = all CPU cores).
+	// With 8 shards on a 4-core server, the default would spawn 32 threads.
+	// Each thread has its own execution context that allocates memory outside the buffer pool.
+	// Reducing to 1 thread cuts thread-local overhead by ~4× and avoids OOM.
+	if _, err := db.Exec("SET threads=1"); err != nil {
+		return fmt.Errorf("set threads: %w", err)
 	}
+	// Disabling insertion-order preservation reduces memory usage for large INSERTs
+	// (DuckDB official suggestion for OOM scenarios).
+	if _, err := db.Exec("SET preserve_insertion_order=false"); err != nil {
+		return fmt.Errorf("set preserve_insertion_order: %w", err)
+	}
+	// No PRIMARY KEY: avoids ART index I/O on every INSERT (which keeps index pages
+	// resident in RSS, causing OOM on the 5.9 GB server). Fresh crawl runs have
+	// unique URLs from the parquet seed file; duplicates can be deduped post-hoc.
 	_, err := db.Exec(`
 		CREATE TABLE IF NOT EXISTS results (
-			url VARCHAR PRIMARY KEY,
+			url VARCHAR,
 			status_code INTEGER,
 			content_type VARCHAR,
 			content_length BIGINT,
@@ -201,7 +210,7 @@ func writeBatchValues(db *sql.DB, batch []Result) int {
 		chunk := batch[i:end]
 
 		var b strings.Builder
-		b.WriteString("INSERT OR REPLACE INTO results (url, status_code, content_type, content_length, body, title, description, language, domain, redirect_url, fetch_time_ms, crawled_at, error, status) VALUES ")
+		b.WriteString("INSERT INTO results (url, status_code, content_type, content_length, body, title, description, language, domain, redirect_url, fetch_time_ms, crawled_at, error, status) VALUES ")
 		args := make([]any, 0, len(chunk)*cols)
 
 		for j, r := range chunk {
