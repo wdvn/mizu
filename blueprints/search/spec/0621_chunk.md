@@ -295,14 +295,14 @@ throughput via overlapping drain/crawl phases).
 
 ## Status
 
-- [ ] Implement `pkg/crawl/bodystore/store.go`
-- [ ] Implement `pkg/crawl/seedcursor.go`
-- [ ] Add `BodyCID` to `pkg/archived/recrawler/types.go`
-- [ ] Update `pkg/archived/recrawler/resultdb.go` (body_cid column + ReopenShards)
-- [ ] Update `pkg/crawl/writer_bin.go` (remove Body, add BodyCID)
-- [ ] Update `pkg/crawl/keepalive.go` (bodyStore integration)
-- [ ] Update `pkg/crawl/autoconfig.go` (AutoBinChanCap, AutoWorkersFull, AutoBatchDomains)
-- [ ] Update `cli/hn.go` (--chunk-mode, --pprof-port, batch loop)
-- [ ] Implement `pkg/crawl/pipeline.go` (Mode C)
-- [ ] Implement `pkg/crawl/chunkbench.go` + Makefile target
-- [ ] Run `make bench-chunk` and pick default
+- [x] Implement `pkg/crawl/bodystore/store.go` — commit `10ca1e44`, `b8ab6565`
+- [x] Implement `pkg/crawl/seedcursor.go` — commit `06b142d4`
+- [x] Add `BodyCID` to `pkg/archived/recrawler/types.go` — commit `08adb9d0`
+- [x] Update `pkg/archived/recrawler/resultdb.go` (body_cid column + ReopenShards) — commit `08adb9d0`
+- [x] Update `pkg/crawl/writer_bin.go` (remove Body, add BodyCID) — commit `481e0eb4`
+- [x] Update `pkg/crawl/keepalive.go` (bodyStore integration) — commit `9f2916d5`
+- [x] Update `pkg/crawl/autoconfig.go` (AutoBinChanCap, AutoWorkersFull, AutoBatchDomains) — commit `4d5e72d9`
+- [x] Update `cli/hn.go` (--chunk-mode, --pprof-port, batch loop) — commit `81724dd0`
+- [x] Implement `pkg/crawl/pipeline.go` (Mode C) — commit `a7e9c413`
+- [x] Implement `pkg/crawl/chunkbench.go` + Makefile target — commit `f398b749`
+- [ ] Run `make bench-chunk` on server2 and pick default (pending deployment)
