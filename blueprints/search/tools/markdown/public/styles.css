@@ -50,6 +50,10 @@ nav a:hover{color:var(--fg)}
 .cvt-btn:hover:not(:disabled){opacity:.85}
 .cvt-btn:disabled{opacity:.5;cursor:default}
 
+/* copy buttons — always on dark code surfaces */
+.copy-btn{background:#222;border:1px solid #333;color:#aaa;font-family:var(--mono);font-size:11px;padding:4px 10px;cursor:pointer;transition:color .15s}
+.copy-btn:hover{color:#fff}
+
 /* footer */
 .site-footer{border-top:1px solid var(--border);padding:24px 32px;text-align:center;font-size:13px;color:var(--fg3)}
 .site-footer a{color:var(--fg3);transition:color .15s}

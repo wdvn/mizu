@@ -32,8 +32,7 @@ export function renderDocs(contentHtml: string): string {
   .doc-wrap table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14px}
   .doc-wrap th{text-align:left;padding:8px 14px;border-bottom:1px solid var(--border);font-weight:600;color:var(--fg)}
   .doc-wrap td{padding:8px 14px;border-bottom:1px solid var(--border2);color:var(--fg2)}
-  .doc-wrap pre .copy-btn{position:absolute;top:10px;right:10px;background:#222;border:1px solid #333;color:#aaa;font-family:var(--mono);font-size:11px;padding:4px 10px;cursor:pointer;transition:all .15s}
-  .doc-wrap pre .copy-btn:hover{color:#fff}
+  .doc-wrap pre .copy-btn{position:absolute;top:10px;right:10px}
   </style>
 </head>
 <body>
