@@ -1,6 +1,8 @@
 import { Hono } from 'hono';
 import { convert } from './convert';
 import { renderPage } from './page';
+import { renderPreview } from './preview';
+import { renderDocs } from './docs';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Env = { AI: any; BROWSER: Fetcher };
@@ -9,6 +11,60 @@ const app = new Hono<{ Bindings: Env }>();
 
 // Landing page
 app.get('/', (c) => c.html(renderPage()));
+
+// llms.txt — machine-readable API summary for LLM agents
+app.get('/llms.txt', (c) =>
+  c.text(`# URL to Markdown API
+# https://markdown.go-mizu.workers.dev
+
+> Convert any URL to clean Markdown. Free, no auth required.
+
+## Base URL
+https://markdown.go-mizu.workers.dev
+
+## Endpoints
+
+### GET /{url}
+Convert a URL to Markdown. Append any absolute URL (http:// or https://) to the base.
+Returns: text/markdown
+Headers:
+  X-Conversion-Method: primary | ai | browser
+  X-Duration-Ms: <milliseconds>
+  X-Title: <percent-encoded page title>
+  X-Markdown-Tokens: <approximate token count>
+  Cache-Control: public, max-age=300, s-maxage=3600, stale-while-revalidate=86400
+
+Example:
+  curl https://markdown.go-mizu.workers.dev/https://example.com
+
+### POST /convert
+Convert a URL and receive structured JSON.
+Body: {"url": "https://example.com"}
+Returns: application/json
+  {
+    "markdown": "<markdown content>",
+    "method": "primary" | "ai" | "browser",
+    "durationMs": <number>,
+    "title": "<page title>",
+    "tokens": <number | undefined>
+  }
+
+Example:
+  curl -X POST https://markdown.go-mizu.workers.dev/convert \\
+    -H 'Content-Type: application/json' \\
+    -d '{"url":"https://example.com"}'
+
+## Conversion Pipeline
+1. primary — Sites supporting Accept: text/markdown return clean Markdown directly
+2. ai      — HTML converted via Cloudflare Workers AI toMarkdown()
+3. browser — JS-heavy pages rendered in headless browser before AI conversion
+
+## Usage Notes
+- Max response body: 5 MB
+- CORS: Access-Control-Allow-Origin: *
+- Edge-cached: s-maxage=3600 with stale-while-revalidate=86400
+`, { headers: { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'public, max-age=86400' } })
+);
 
 // JSON API: POST /convert
 app.post('/convert', async (c) => {
@@ -43,6 +99,12 @@ app.options('/*', (c) => {
   });
 });
 
+// Docs page
+app.get('/docs', (c) => c.html(renderDocs()));
+
+// Preview page — client reads ?url= and calls POST /convert
+app.get('/preview', (c) => c.html(renderPreview()));
+
 // Text API: GET /:url+ (mirrors markdown.new/https://example.com pattern)
 // Matches any path starting with http:// or https://
 app.get('/*', async (c) => {
@@ -63,7 +125,7 @@ app.get('/*', async (c) => {
         'X-Title': encodeURIComponent(result.title.slice(0, 200)),
         ...(result.tokens ? { 'X-Markdown-Tokens': String(result.tokens) } : {}),
         'Access-Control-Allow-Origin': '*',
-        'Cache-Control': 'public, max-age=300',
+        'Cache-Control': 'public, max-age=300, s-maxage=3600, stale-while-revalidate=86400',
       },
     });
   } catch (err) {
