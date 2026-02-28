@@ -63,7 +63,8 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 		if err != nil {
 			return fmt.Errorf("opening result db: %w", err)
 		}
-		defer rdb.Close()
+		// rdb lifecycle: for duckdb mode, RunJob closes via resultWriter.Close().
+		// For bin mode, rdb is closed explicitly below after RunJob returns.
 	}
 
 	switch writerMode {
@@ -78,9 +79,11 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 		var bwErr error
 		binWriter, bwErr = crawl.NewBinSegWriter(segDir, args.SegSizeMB, int(si.MemAvailableMB), rdb)
 		if bwErr != nil {
+			rdb.Close() // rdb is not owned by binWriter; close before returning
 			return fmt.Errorf("creating bin writer: %w", bwErr)
 		}
-		defer binWriter.Close()
+		// binWriter lifecycle: RunJob closes via resultWriter.Close().
+		// rdb is closed explicitly below after RunJob returns (binWriter.Close flushes to rdb first).
 		ls.binWriter = binWriter
 	}
 
@@ -161,6 +164,11 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 	}()
 
 	jobResult, err := crawl.RunJob(ctx, args.Seeds, args.DNSCache, args.JobCfg)
+
+	// bin mode: RunJob closed binWriter; now close the backing rdb.
+	if writerMode == "bin" && rdb != nil {
+		rdb.Close()
+	}
 
 	cancelProgress()
 	<-progressDone
