@@ -116,7 +116,11 @@ func (e *KeepAliveEngine) Run(ctx context.Context, seeds []SeedURL,
 			}
 			batch = nil
 		}
-		for _, s := range seeds {
+		for i, s := range seeds {
+			// Zero seeds[i] immediately after use so the GC can reclaim the
+			// URL/Domain/Host string data progressively as domains complete,
+			// rather than holding all 6.9M seeds in memory for the full run.
+			seeds[i] = SeedURL{}
 			if dns.IsDead(s.Host) {
 				failures.AddURL(FailedURL{
 					URL:    s.URL,
