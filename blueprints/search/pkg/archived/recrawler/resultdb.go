@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"time"
 	"unicode/utf8"
 
 	_ "github.com/duckdb/duckdb-go/v2"
@@ -287,23 +286,21 @@ func (rdb *ResultDB) Dir() string {
 // to Go's GC. Call between domain batches in batch/pipeline chunk modes.
 func (rdb *ResultDB) ReopenShards() error {
 	for i, s := range rdb.shards {
-		// Flush any pending batch before closing.
+		// Flush any pending batch into the channel, then drain the flusher
+		// goroutine by closing the channel and waiting for it to finish.
+		// This avoids the race where len(flushCh)==0 but the goroutine hasn't
+		// finished calling writeBatchValues yet.
 		s.mu.Lock()
 		if len(s.batch) > 0 {
 			batch := s.batch
 			s.batch = make([]Result, 0, s.batchSz)
 			s.mu.Unlock()
 			s.flushCh <- batch
-			// Wait for the flusher goroutine to drain it.
-			for {
-				if len(s.flushCh) == 0 {
-					break
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
 		} else {
 			s.mu.Unlock()
 		}
+		close(s.flushCh)
+		<-s.done // wait for flusher to finish all writes
 
 		// Close and reopen to release DuckDB's CGO buffer pool.
 		path := filepath.Join(rdb.dir, fmt.Sprintf("results_%03d.duckdb", i))
@@ -317,6 +314,11 @@ func (rdb *ResultDB) ReopenShards() error {
 			return fmt.Errorf("reopen shard %d settings: %w", i, err)
 		}
 		s.db = db
+
+		// Start a fresh flusher goroutine for the next batch.
+		s.flushCh = make(chan []Result, 2)
+		s.done = make(chan struct{})
+		go s.flusher(&rdb.flushed)
 	}
 	return nil
 }
