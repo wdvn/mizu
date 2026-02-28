@@ -875,6 +875,7 @@ func newCCRecrawl() *cobra.Command {
 		noRetry             bool
 		dbMemMB             int
 		dbShards            int
+		chunkMode           string
 	)
 
 	cmd := &cobra.Command{
@@ -959,6 +960,7 @@ Examples:
 			noRetry:             noRetry,
 			dbMemMB:             dbMemMB,
 			dbShards:            dbShards,
+			chunkMode:           chunkMode,
 		})
 		},
 	}
@@ -993,6 +995,7 @@ Examples:
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs")
 	cmd.Flags().IntVar(&dbMemMB, "db-mem-mb", 0, "DuckDB memory per shard in MB (0=auto: 15% avail RAM / shards)")
 	cmd.Flags().IntVar(&dbShards, "db-shards", 0, "ResultDB shard count (0=auto: clamp(CPUs×2, 4, 16))")
+	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "batch", "Seed delivery mode: batch|stream (batch releases DuckDB CGO memory between domain chunks)")
 
 	return cmd
 }
@@ -1026,6 +1029,7 @@ type ccRecrawlOpts struct {
 	noRetry             bool
 	dbMemMB             int
 	dbShards            int
+	chunkMode           string
 }
 
 func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
@@ -1371,6 +1375,7 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		InsecureTLS:         true,
 		DomainFailThreshold: opts.domainFailThreshold,
 		BatchSize:           opts.batchSize,
+		ChunkMode:           opts.chunkMode,
 	}
 	if opts.domainTimeoutMs > 0 {
 		jcfg.DomainTimeout = time.Duration(opts.domainTimeoutMs) * time.Millisecond
