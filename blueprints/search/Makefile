@@ -345,6 +345,20 @@ quickstart: ## Quick start: initialize, seed, and run
 	@make seed
 	@make run
 
+.PHONY: bench-chunk
+bench-chunk: ## Run all 3 chunk modes with 200K seeds and compare results
+	@for mode in stream batch pipeline; do \
+		echo "=== Running chunk mode: $$mode ==="; \
+		rm -f $(DATA_DIR)/hn/recrawl/results/*.duckdb; \
+		$(BINARY) hn recrawl --limit 200000 --no-retry --chunk-mode $$mode; \
+	done
+	@echo ""
+	@echo "=== Benchmark Results ==="
+	@for mode in stream batch pipeline; do \
+		echo "--- $$mode ---"; \
+		cat $(DATA_DIR)/hn/recrawl/bench_chunk_$$mode.json 2>/dev/null || echo "(not found)"; \
+	done
+
 .PHONY: help
 help: ## Show available commands
 	@echo ""
