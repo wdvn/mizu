@@ -2,40 +2,56 @@
 :root{
   --sans:'Geist',-apple-system,sans-serif;
   --mono:'Geist Mono',ui-monospace,monospace;
-  --bg:#fff;--fg:#0a0a0a;--fg2:#555;--fg3:#999;
-  --border:#e8e8e8;--border2:#e0e0e0;
-  --code-bg:#111;--code-fg:#e4e4e7;
+  --bg:#ffffff;--bg2:#f7f7f7;
+  --fg:#0a0a0a;--fg2:#525252;--fg3:#a3a3a3;
+  --border:#e5e5e5;--border2:#d4d4d4;
+  --code-bg:#0c0c0c;--code-fg:#e4e4e7;
   --w:1120px
 }
+[data-theme="dark"]{
+  --bg:#0a0a0a;--bg2:#111111;
+  --fg:#f0f0ef;--fg2:#a3a3a3;--fg3:#525252;
+  --border:#222222;--border2:#2e2e2e;
+  --code-bg:#141414;--code-fg:#e4e4e7
+}
 html{font-size:15px}
-body{font-family:var(--sans);background:var(--bg);color:var(--fg);line-height:1.6;-webkit-font-smoothing:antialiased}
+body{font-family:var(--sans);background:var(--bg);color:var(--fg);line-height:1.6;-webkit-font-smoothing:antialiased;transition:background .2s,color .2s}
 a{color:inherit;text-decoration:none}
-code{font-family:var(--mono);font-size:11.5px;background:#f5f5f5;padding:1px 5px}
+code{font-family:var(--mono);font-size:11.5px;background:var(--bg2);padding:1px 5px}
 .w{max-width:var(--w);margin:0 auto;padding:0 32px}
 
 /* header */
-header{padding:14px 32px}
+header{padding:14px 32px;border-bottom:1px solid var(--border)}
 .hdr{display:flex;align-items:center;justify-content:space-between}
 .logo{font-size:13.5px;font-weight:500;letter-spacing:-.02em;display:flex;align-items:center;gap:8px;color:var(--fg)}
-.logo-sq{width:22px;height:22px;background:var(--fg);display:flex;align-items:center;justify-content:center;flex-shrink:0}
-nav a{font-size:13px;color:var(--fg3);margin-left:20px;transition:color .15s}
+.logo-sq{width:22px;height:22px;background:var(--fg);display:flex;align-items:center;justify-content:center;flex-shrink:0;transition:background .2s}
+nav{display:flex;align-items:center;gap:4px}
+nav a{font-size:13px;color:var(--fg3);padding:6px 10px;transition:color .15s}
 nav a:hover{color:var(--fg)}
 
+/* theme toggle */
+.theme-toggle{background:none;border:1px solid var(--border);color:var(--fg3);cursor:pointer;padding:6px 8px;display:flex;align-items:center;transition:color .15s,border-color .15s;margin-left:4px}
+.theme-toggle:hover{color:var(--fg);border-color:var(--border2)}
+
 /* badges */
-.badge{font-family:var(--mono);font-size:11px;padding:2px 7px;white-space:nowrap;flex-shrink:0}
-.b-native{background:#f3f0ff;color:#5b21b6}
-.b-ai{background:#eff6ff;color:#1d4ed8}
-.b-browser{background:#fffbeb;color:#92400e}
-.b-dim{background:#f5f5f5;color:#555}
+.badge{font-family:var(--mono);font-size:11px;padding:2px 7px;white-space:nowrap;flex-shrink:0;background:var(--bg2);color:var(--fg2);border:1px solid var(--border)}
+.b-native,.b-ai,.b-browser{background:var(--bg2);color:var(--fg2);border:1px solid var(--border)}
+.b-dim{background:var(--bg2);color:var(--fg3);border:1px solid var(--border)}
 
 /* spinner */
 @keyframes spin{to{transform:rotate(360deg)}}
 .spinner{display:inline-block;width:22px;height:22px;border:2px solid var(--border2);border-top-color:var(--fg);animation:spin .7s linear infinite}
 
 /* url input + convert button */
-.url-in{flex:1;font-family:var(--mono);font-size:14px;padding:10px 14px;border:1px solid var(--border);border-right:none;background:#fff;color:var(--fg);outline:none;transition:border-color .15s;min-width:0}
+.url-in{flex:1;font-family:var(--mono);font-size:14px;padding:10px 14px;border:1px solid var(--border);border-right:none;background:var(--bg);color:var(--fg);outline:none;transition:border-color .15s,background .2s,color .2s;min-width:0}
 .url-in::placeholder{color:var(--fg3)}
 .url-in:focus{border-color:var(--fg)}
-.cvt-btn{font-family:var(--sans);font-size:14px;font-weight:500;padding:10px 22px;background:var(--fg);color:#fff;border:1px solid var(--fg);cursor:pointer;white-space:nowrap;transition:background .15s}
-.cvt-btn:hover:not(:disabled){background:#333;border-color:#333}
-.cvt-btn:disabled{opacity:.6;cursor:default}
+.cvt-btn{font-family:var(--sans);font-size:14px;font-weight:500;padding:10px 22px;background:var(--fg);color:var(--bg);border:1px solid var(--fg);cursor:pointer;white-space:nowrap;transition:opacity .15s}
+.cvt-btn:hover:not(:disabled){opacity:.85}
+.cvt-btn:disabled{opacity:.5;cursor:default}
+
+/* footer */
+.site-footer{border-top:1px solid var(--border);padding:24px 32px;text-align:center;font-size:13px;color:var(--fg3)}
+.site-footer a{color:var(--fg3);transition:color .15s}
+.site-footer a:hover{color:var(--fg)}
+.site-footer .sep{margin:0 8px;opacity:.4}
