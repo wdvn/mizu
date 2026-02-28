@@ -92,13 +92,19 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 		_ = args.BodyStoreDir
 	}
 
+	// aliveDomains is populated by v3ProgressWriter during pass 1.
+	// Every domain that returns at least one successful result is added here.
+	// LoadRetrySeeds filters the pass-2 retry list to only these domains,
+	// skipping retries on domains where every URL timed out (likely dead servers).
+	var aliveDomains sync.Map
+
 	// Inject storage constructors
 	if writerMode != "devnull" {
 		args.JobCfg.OpenResultWriter = func() (crawl.ResultWriter, error) {
 			if writerMode == "bin" {
-				return &v3ProgressWriter{inner: binWriter, ls: ls}, nil
+				return &v3ProgressWriter{inner: binWriter, ls: ls, alive: &aliveDomains}, nil
 			}
-			return &v3ProgressWriter{inner: rdb, ls: ls}, nil
+			return &v3ProgressWriter{inner: rdb, ls: ls, alive: &aliveDomains}, nil
 		}
 		args.JobCfg.OpenFailureWriter = func() (crawl.FailureWriter, error) {
 			fdb, err := store.OpenFailedDB(args.FailedDBPath)
@@ -108,7 +114,29 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 			return &v3ProgressFailureWriter{inner: fdb, ls: ls}, nil
 		}
 		args.JobCfg.LoadRetrySeeds = func(ctx context.Context, since time.Time) ([]crawl.SeedURL, error) {
-			return store.LoadRetryURLsSince(args.FailedDBPath, since)
+			seeds, err := store.LoadRetryURLsSince(args.FailedDBPath, since)
+			if err != nil || len(seeds) == 0 {
+				return seeds, err
+			}
+			// Filter: only retry URLs from domains that had at least one success in pass 1.
+			// Domains with zero successes are almost certainly dead — retrying them wastes
+			// time and inflates the failure count without rescuing any URLs.
+			total := len(seeds)
+			filtered := seeds[:0]
+			for _, s := range seeds {
+				if _, ok := aliveDomains.Load(s.Domain); ok {
+					filtered = append(filtered, s)
+				}
+			}
+			skipped := total - len(filtered)
+			if skipped > 0 {
+				fmt.Printf("  Pass-2 filter  %s → %s retry seeds (%s dead-domain URLs skipped)\n",
+					labelStyle.Render(formatInt64Exact(int64(total))),
+					labelStyle.Render(formatInt64Exact(int64(len(filtered)))),
+					labelStyle.Render(formatInt64Exact(int64(skipped))),
+				)
+			}
+			return filtered, nil
 		}
 	}
 
@@ -395,14 +423,20 @@ func (ls *v3LiveStats) p95Ms() int64 {
 var v3LatEdges = [8]int64{100, 250, 500, 1000, 2000, 3500, 5000, 10000}
 
 // v3ProgressWriter wraps ResultWriter and tracks live statistics.
+// When alive is non-nil, every successful result's domain is stored in the map —
+// used to filter pass-2 retry seeds to only domains that showed signs of life.
 type v3ProgressWriter struct {
 	inner crawl.ResultWriter
 	ls    *v3LiveStats
+	alive *sync.Map // optional: domain → struct{}{} for all pass-1 successes
 }
 
 func (p *v3ProgressWriter) Add(r crawl.Result) {
 	p.inner.Add(r)
 	p.ls.recordResult(r)
+	if p.alive != nil && r.Error == "" {
+		p.alive.Store(r.Domain, struct{}{})
+	}
 }
 func (p *v3ProgressWriter) Flush(ctx context.Context) error { return p.inner.Flush(ctx) }
 func (p *v3ProgressWriter) Close() error                    { return p.inner.Close() }
