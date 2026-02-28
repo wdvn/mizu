@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -528,8 +529,8 @@ func FailedURLTopDomains(dbPath string, n int) ([][2]string, error) {
 	for rows.Next() {
 		var domain string
 		var count int
-		rows.Scan(&domain, &count) //nolint:errcheck
-		result = append(result, [2]string{domain, fmt.Sprintf("%d", count)})
+		rows.Scan(&domain, &count)
+		result = append(result, [2]string{domain, strconv.Itoa(count)})
 	}
 	return result, nil
 }
