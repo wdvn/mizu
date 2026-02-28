@@ -122,17 +122,25 @@ GCC 14 with Ubuntu 24.04 provides:
 - Improved alias analysis → faster DuckDB query execution
 
 The current build uses `-static-libstdc++ -static-libgcc` for portability.
-No `-march=native` flag is set — the GCC toolchain defaults to generic x86-64.
 
-**Future optimization:** Add `-march=x86-64-v3` (AVX2 baseline) in `CGO_CFLAGS`
-to enable SIMD vectorization for DuckDB on the server's AMD EPYC CPU:
+**Implemented (commit `0720d9fe`):** `-march=x86-64-v3` in `Dockerfile.linux-noble`:
 ```dockerfile
 ARG CGO_CFLAGS="-O2 -march=x86-64-v3"
 ARG CGO_CXXFLAGS="-O2 -march=x86-64-v3"
+ENV CGO_CFLAGS=${CGO_CFLAGS}
+ENV CGO_CXXFLAGS=${CGO_CXXFLAGS}
 ```
-This is a Dockerfile.linux-noble only optimization (server2 native deployment).
-Do NOT apply to Dockerfile.linux-focal (Ubuntu 20.04) — may generate AVX2 instructions
-that aren't present on older hardware.
+Only in `Dockerfile.linux-noble` (server2 native). Not in `Dockerfile.linux-focal`.
+
+**Benchmark result: no measurable improvement** for the crawl workload.
+
+The crawl pipeline is **network-bound, not compute-bound**: DuckDB operations
+(seed prep, drain inserts) are dwarfed by HTTP I/O. The gob flusher bottleneck
+(`chan=100%`) is pure Go code — AVX2 does not help it. Benchmark variance from
+slow-domain DomainTimeout hangs (~30s each) completely masks any compute gain.
+
+AVX2 would matter for compute-heavy DuckDB workloads (bulk analytics queries,
+large sorts/joins). For the HN recrawl pipeline it makes no measurable difference.
 
 ### Go 1.26 Runtime Notes
 
@@ -207,6 +215,8 @@ rm -f ~/data/hn/recrawl/failed.duckdb
 | focal bin(gob) | 2,355   | 9,216    | 55s      | **100%**  | 30,746   | pre-fix |
 | noble devnull  | 3,994   | 8,982    | 32s      | N/A       | 5,829    | post-fix (no writer) |
 | noble bin(gob) | 2,547   | 9,363    | 50s      | **100%**  | 35,031   | post-fix |
+| noble+avx2 devnull | 2,487 | 13,579  | 52s      | N/A       | 3,182    | AVX2; network-dominated |
+| noble+avx2 bin | 2,091   | 6,190    | 61s      | **100%**  | 32,749   | AVX2; network-dominated |
 
 ### Flush Fix Analysis
 
@@ -275,4 +285,6 @@ The `deploy-linux-noble` target:
 - [x] Run noble vs focal devnull benchmark — noble 3,994 avg / 8,982 peak / 32s
 - [x] Run noble bin-writer benchmark with drain fix — 2,547 avg / 9,363 peak / 50s
 - [x] Fill in benchmark results table
+- [x] Add `-march=x86-64-v3` AVX2 to `Dockerfile.linux-noble` (`0720d9fe`)
+- [x] Benchmark AVX2 — no improvement; workload is network-bound not compute-bound
 - [ ] **Future:** Fix chan=100% — cap workers or implement parallel flusher shards
