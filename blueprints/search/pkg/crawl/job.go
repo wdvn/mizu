@@ -200,6 +200,10 @@ func RunJob(ctx context.Context, seeds []SeedURL, dns DNSCache, cfg JobConfig) (
 			// Disable adaptive timeout for pass 2: fast domains skew the adaptive P95
 			// down, cutting off slow-but-rescuable URLs that need the full retry timeout.
 			retryCfg.DisableAdaptiveTimeout = true
+			// DomainDeadProbe=2: after 2 timeouts with 0 pass-2 successes, abandon domain.
+			// Eliminates false negatives from unfiltered retry set — alive-but-slow domains
+			// continue, dead domains fail fast (one 15s batch) and are skipped.
+			retryCfg.DomainDeadProbe = 2
 			if cfg.Pass2Workers > 0 {
 				retryCfg.Workers = cfg.Pass2Workers
 			}
