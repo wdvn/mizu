@@ -696,7 +696,7 @@ and adaptive timeouts.`,
 	cmd.Flags().IntVar(&maxConnsPerDomain, "max-conns-per-domain", -1, "Max simultaneous connections per domain (-1 = auto from hardware)")
 	cmd.Flags().IntVar(&timeoutMs, "timeout", 1000, "Per-request HTTP timeout in milliseconds (pass 1)")
 	cmd.Flags().BoolVar(&statusOnly, "status-only", false, "Only check HTTP status, close body immediately (fastest)")
-	cmd.Flags().IntVar(&batchSize, "batch-size", 100, "DB write batch size")
+	cmd.Flags().IntVar(&batchSize, "batch-size", 5000, "DB write batch size")
 	cmd.Flags().IntVar(&slowDomainMs, "slow-domain-ms", 30_000, "Highlight domains active for longer than this threshold (ms)")
 	cmd.Flags().IntVar(&domainFailThreshold, "domain-fail-threshold", -1, "Abandon domain after this many timeout rounds (×conns); -1=engine default (3)")
 	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", -1, "Per-domain context deadline in ms; 0=disabled, -1=adaptive (2×sweep time, clamped [30s,10min])")
@@ -708,7 +708,7 @@ and adaptive timeouts.`,
 
 	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 5000, "Pass-2 timeout for retrying http_timeout URLs (ms); 0=disabled")
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs (faster; may miss slow-but-live servers)")
-	cmd.Flags().StringVar(&writerMode, "writer", "duckdb", "Result writer backend: duckdb (default), bin (non-blocking NDJSON→DuckDB drain), devnull (benchmark only)")
+	cmd.Flags().StringVar(&writerMode, "writer", "bin", "Result writer backend: bin (default, non-blocking segment→DuckDB drain), duckdb (direct), devnull (benchmark only)")
 	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "stream", "Chunk mode: stream|batch|pipeline (stream: sort-then-stream, lower memory; batch: N-domain chunks)")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 0, "Override batch domain count (0=auto)")
 	cmd.Flags().IntVar(&pprofPort, "pprof-port", 0, "Enable pprof HTTP server on this port (0=off)")
