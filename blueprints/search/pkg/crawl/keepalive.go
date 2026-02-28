@@ -215,13 +215,25 @@ func processOneDomain(ctx context.Context, urls []SeedURL,
 		defer cfg.Notifier.EndDomain(domain)
 	}
 
-	// Per-domain context: if DomainTimeout > 0, cancel remaining URLs after the deadline.
-	// This short-circuits dead HTTP domains (which would each use a full timeout-per-batch)
-	// without waiting for every URL to individually time out.
+	// Per-domain context deadline.
+	// DomainTimeout > 0: explicit deadline.
+	// DomainTimeout < 0: adaptive — 2× worst-case sweep time, clamped [30s, 10min].
+	// DomainTimeout == 0: disabled.
 	domainCtx := ctx
-	if cfg.DomainTimeout > 0 {
+	effectiveDomainTimeout := cfg.DomainTimeout
+	if effectiveDomainTimeout < 0 {
+		sweep := time.Duration(len(urls)) * cfg.Timeout / time.Duration(max(innerN, 1)) * 2
+		if sweep < 30*time.Second {
+			sweep = 30 * time.Second
+		}
+		if sweep > 10*time.Minute {
+			sweep = 10 * time.Minute
+		}
+		effectiveDomainTimeout = sweep
+	}
+	if effectiveDomainTimeout > 0 {
 		var cancelDomain context.CancelFunc
-		domainCtx, cancelDomain = context.WithTimeout(ctx, cfg.DomainTimeout)
+		domainCtx, cancelDomain = context.WithTimeout(ctx, effectiveDomainTimeout)
 		defer cancelDomain()
 	}
 
@@ -249,6 +261,7 @@ func processOneDomain(ctx context.Context, urls []SeedURL,
 	close(urlCh)
 
 	var domainTimeouts atomic.Int64
+	var domainSuccesses atomic.Int64
 	abandonCh := make(chan struct{})
 	var abandonOnce sync.Once
 
@@ -328,6 +341,11 @@ func processOneDomain(ctx context.Context, urls []SeedURL,
 					if effectiveThreshold > 0 && n >= effectiveThreshold {
 						abandonOnce.Do(func() { close(abandonCh) })
 					}
+					// Dead-domain probe: if DomainDeadProbe timeouts with 0 successes,
+					// the domain's TCP/HTTP layer is dead — abandon remaining URLs.
+					if cfg.DomainDeadProbe > 0 && n >= int64(cfg.DomainDeadProbe) && domainSuccesses.Load() == 0 {
+						abandonOnce.Do(func() { close(abandonCh) })
+					}
 					failures.AddURL(FailedURL{
 						URL:         seed.URL,
 						Domain:      seed.Domain,
@@ -346,6 +364,7 @@ func processOneDomain(ctx context.Context, urls []SeedURL,
 					})
 				default:
 					ok.Add(1)
+					domainSuccesses.Add(1)
 					adaptive.record(r.FetchTimeMs) // only successful latencies
 				}
 				results.Add(r)

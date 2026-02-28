@@ -556,6 +556,7 @@ func newHNRecrawl() *cobra.Command {
 		slowDomainMs        int
 		domainFailThreshold int
 		domainTimeoutMs     int
+		domainDeadProbe     int
 		retryTimeoutMs      int
 		noRetry             bool
 		writerMode          string
@@ -675,7 +676,7 @@ and adaptive timeouts.`,
 			fmt.Println()
 
 			return runHNRecrawlV3(ctx, cfg, seedRes,
-				engine, workers, maxConnsPerDomain, timeoutMs, domainFailThreshold, domainTimeoutMs, statusOnly, batchSize, int64(slowDomainMs),
+				engine, workers, maxConnsPerDomain, timeoutMs, domainFailThreshold, domainTimeoutMs, domainDeadProbe, statusOnly, batchSize, int64(slowDomainMs),
 				dnsWorkers, dnsTimeoutMs,
 				retryTimeoutMs, noRetry, writerMode,
 				chunkMode, chunkSize, bodyStoreDir,
@@ -697,7 +698,8 @@ and adaptive timeouts.`,
 	cmd.Flags().IntVar(&batchSize, "batch-size", 100, "DB write batch size")
 	cmd.Flags().IntVar(&slowDomainMs, "slow-domain-ms", 30_000, "Highlight domains active for longer than this threshold (ms)")
 	cmd.Flags().IntVar(&domainFailThreshold, "domain-fail-threshold", -1, "Abandon domain after this many timeout rounds (×conns); -1=engine default (3)")
-	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", 30_000, "Per-domain context deadline in ms; cancel remaining URLs after this (0=disabled)")
+	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", -1, "Per-domain context deadline in ms; 0=disabled, -1=adaptive (2×sweep time, clamped [30s,10min])")
+	cmd.Flags().IntVar(&domainDeadProbe, "domain-dead-probe", 10, "Abandon domain after this many consecutive timeouts with 0 successes (0=disabled)")
 
 	cmd.Flags().IntVar(&dnsWorkers, "dns-workers", 1000, "Concurrent DNS workers (0=skip DNS pre-resolution)")
 	cmd.Flags().IntVar(&dnsTimeoutMs, "dns-timeout", 1500, "DNS lookup timeout in milliseconds")
@@ -723,7 +725,7 @@ func runHNRecrawlV3(ctx context.Context,
 	hnCfg hn.Config,
 	seedRes *hn.RecrawlSeedResult,
 	engineName string,
-	workers, maxConnsPerDomain, timeoutMs, domainFailThreshold, domainTimeoutMs int,
+	workers, maxConnsPerDomain, timeoutMs, domainFailThreshold, domainTimeoutMs, domainDeadProbe int,
 	statusOnly bool,
 	batchSize int,
 	slowDomainMs int64,
@@ -871,14 +873,15 @@ func runHNRecrawlV3(ctx context.Context,
 		StatusOnly:          statusOnly,
 		InsecureTLS:         true,
 		DomainFailThreshold: domainFailThreshold,
+		DomainDeadProbe:     domainDeadProbe,
 		BatchSize:           batchSize,
 		ChunkMode:           chunkMode,
 		ChunkSize:           chunkSize,
 		SeedPath:            seedRes.OutDBPath,
 		Pass2Workers:        p2Workers,
 	}
-	if domainTimeoutMs > 0 {
-		jcfg.DomainTimeout = time.Duration(domainTimeoutMs) * time.Millisecond
+	if domainTimeoutMs != 0 {
+		jcfg.DomainTimeout = time.Duration(domainTimeoutMs) * time.Millisecond // -1ms = adaptive
 	}
 
 	return runRecrawlJob(ctx, recrawlJobArgs{

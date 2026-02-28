@@ -871,6 +871,7 @@ func newCCRecrawl() *cobra.Command {
 		engine              string
 		domainTimeoutMs     int
 		domainFailThreshold int
+		domainDeadProbe     int
 		retryTimeoutMs      int
 		noRetry             bool
 		dbMemMB             int
@@ -956,6 +957,7 @@ Examples:
 				engine:              engine,
 			domainTimeoutMs:     domainTimeoutMs,
 			domainFailThreshold: domainFailThreshold,
+			domainDeadProbe:     domainDeadProbe,
 			retryTimeoutMs:      retryTimeoutMs,
 			noRetry:             noRetry,
 			dbMemMB:             dbMemMB,
@@ -989,8 +991,9 @@ Examples:
 	cmd.Flags().IntVar(&limit, "limit", 0, "Max URLs to recrawl (0=all from index)")
 	cmd.Flags().IntVar(&batchSize, "batch-size", 5000, "DB write batch size")
 	cmd.Flags().StringVar(&engine, "engine", "keepalive", "Crawl engine: keepalive|epoll|swarm|rawhttp")
-	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", 30_000, "Per-domain context deadline in ms; cancel remaining URLs after this (0=disabled)")
+	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", -1, "Per-domain context deadline in ms; 0=disabled, -1=adaptive (2×sweep time, clamped [30s,10min])")
 	cmd.Flags().IntVar(&domainFailThreshold, "domain-fail-threshold", -1, "Abandon domain after this many timeout rounds (×conns); -1=engine default (3)")
+	cmd.Flags().IntVar(&domainDeadProbe, "domain-dead-probe", 10, "Abandon domain after this many consecutive timeouts with 0 successes (0=disabled)")
 	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 10000, "Pass-2 timeout in ms for retrying timeout URLs (0=disabled)")
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs")
 	cmd.Flags().IntVar(&dbMemMB, "db-mem-mb", 0, "DuckDB memory per shard in MB (0=auto: 15% avail RAM / shards)")
@@ -1025,6 +1028,7 @@ type ccRecrawlOpts struct {
 	engine              string
 	domainTimeoutMs     int
 	domainFailThreshold int
+	domainDeadProbe     int
 	retryTimeoutMs      int
 	noRetry             bool
 	dbMemMB             int
@@ -1374,11 +1378,12 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		StatusOnly:          opts.statusOnly,
 		InsecureTLS:         true,
 		DomainFailThreshold: opts.domainFailThreshold,
+		DomainDeadProbe:     opts.domainDeadProbe,
 		BatchSize:           opts.batchSize,
 		ChunkMode:           opts.chunkMode,
 	}
-	if opts.domainTimeoutMs > 0 {
-		jcfg.DomainTimeout = time.Duration(opts.domainTimeoutMs) * time.Millisecond
+	if opts.domainTimeoutMs != 0 {
+		jcfg.DomainTimeout = time.Duration(opts.domainTimeoutMs) * time.Millisecond // -1ms = adaptive
 	}
 
 	// recrawler.SeedURL is a type alias for crawl.SeedURL — no conversion needed.
@@ -1430,7 +1435,7 @@ func newCCRecrawlDrone() *cobra.Command {
 			cfg.SwarmResultDir = resultDir
 			cfg.SwarmFailedDB = failedDB
 			cfg.DomainFailThreshold = domainFailThreshold
-			if domainTimeoutMs > 0 {
+			if domainTimeoutMs != 0 {
 				cfg.DomainTimeout = time.Duration(domainTimeoutMs) * time.Millisecond
 			}
 			return crawl.RunDrone(cmd.Context(), cfg)
