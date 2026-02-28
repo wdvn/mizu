@@ -1197,18 +1197,8 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 	}
 
 	// ── Step 4: Batch DNS pre-resolution ────────────────────────
-	recrawlCfg := recrawler.Config{
-		Workers:           opts.workers,
-		DNSWorkers:        opts.dnsWorkers,
-		DNSTimeout:        time.Duration(opts.dnsTimeout) * time.Millisecond,
-		Timeout:           time.Duration(opts.timeout) * time.Millisecond,
-		StatusOnly:        opts.statusOnly,
-		HeadOnly:          opts.headOnly,
-		TransportShards:   opts.transportShards,
-		MaxConnsPerDomain: opts.maxConnsPerDomain,
-		DNSPrefetch:       opts.dnsPrefetch,
-		BatchSize:         opts.batchSize,
-	}
+	dnsTimeout := time.Duration(opts.dnsTimeout) * time.Millisecond
+	dnsWorkers := opts.dnsWorkers
 
 	resultDir := ccCfg.RecrawlDir()
 	dnsPath := ccCfg.DNSCachePath()
@@ -1225,23 +1215,11 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 		fmt.Println()
 	}
 
-	// Check for resume
-	var skip map[string]bool
-	if opts.resume {
-		fmt.Println(infoStyle.Render("Checking for previous crawl state..."))
-		skip, err = recrawler.LoadAlreadyCrawledFromDir(ctx, resultDir)
-		if err != nil {
-			fmt.Println(warningStyle.Render(fmt.Sprintf("  Could not load state: %v", err)))
-		} else if len(skip) > 0 {
-			fmt.Println(successStyle.Render(fmt.Sprintf("  Resuming: skipping %d already-crawled URLs", len(skip))))
-		}
-	}
-
 	var dnsResolver *recrawler.DNSResolver
 	if opts.dnsPrefetch {
 		fmt.Println(infoStyle.Render("Batch DNS pre-resolution..."))
 
-		dnsResolver = recrawler.NewDNSResolver(recrawlCfg.DNSTimeout)
+		dnsResolver = recrawler.NewDNSResolver(dnsTimeout)
 		if opts.reloadDNSCache {
 			fmt.Println(labelStyle.Render("  DNS cache: reload requested (ignoring existing cache file for this run)"))
 			fmt.Println(labelStyle.Render("  Tip: omit --reload-dns-cache to reuse previous DNS results"))
@@ -1259,14 +1237,12 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 		// DNS cache is keyed by URL hostname used in HTTP dialing.
 		allHosts := make(map[string]bool, len(seeds))
 		for _, s := range seeds {
-			if skip == nil || !skip[s.URL] {
-				host := strings.TrimSpace(s.Host)
-				if host == "" {
-					host = strings.TrimSpace(s.Domain)
-				}
-				if host != "" {
-					allHosts[host] = true
-				}
+			host := strings.TrimSpace(s.Host)
+			if host == "" {
+				host = strings.TrimSpace(s.Domain)
+			}
+			if host != "" {
+				allHosts[host] = true
 			}
 		}
 		hostList := make([]string, 0, len(allHosts))
@@ -1282,9 +1258,9 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 		}
 
 		effDNSWorkers, effDNSTimeout, dnsTuneNotes := ccResolveEffectiveDNSTuning(opts, cov.Pending)
-		recrawlCfg.DNSTimeout = effDNSTimeout
+		dnsTimeout = effDNSTimeout
 		if effDNSWorkers > 0 {
-			recrawlCfg.DNSWorkers = effDNSWorkers
+			dnsWorkers = effDNSWorkers
 		}
 		for _, note := range dnsTuneNotes {
 			fmt.Println(labelStyle.Render("  " + note))
@@ -1299,10 +1275,10 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 			baseDead := dnsResolver.DeadCount()
 			baseTimeout := dnsResolver.TimeoutCount()
 			fmt.Println(infoStyle.Render(fmt.Sprintf("  Resolving %s uncached hosts (%d workers, %v timeout)...",
-				ccFmtInt64(int64(cov.Pending)), recrawlCfg.DNSWorkers, recrawlCfg.DNSTimeout)))
+				ccFmtInt64(int64(cov.Pending)), dnsWorkers, dnsTimeout)))
 
 			var dnsDisplayLines int
-			live, dead, timedout := dnsResolver.ResolveBatch(ctx, hostList, recrawlCfg.DNSWorkers, recrawlCfg.DNSTimeout,
+			live, dead, timedout := dnsResolver.ResolveBatch(ctx, hostList, dnsWorkers, dnsTimeout,
 				func(p recrawler.DNSProgress) {
 					if dnsDisplayLines > 0 {
 						fmt.Printf("\033[%dA\033[J", dnsDisplayLines)
@@ -1347,231 +1323,14 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 		}
 	}
 
-	// ── v3 engine dispatch ──────────────────────────────────────────────────
-	if opts.engine != "" {
-		if err := os.MkdirAll(filepath.Dir(failedDBPath), 0755); err != nil {
-			return fmt.Errorf("creating recrawl data dir: %w", err)
-		}
-		return runCCRecrawlV3(ctx, opts, seeds, dnsResolver, resultDir, failedDBPath)
+	// ── Engine dispatch: always use keepalive (v3) ──────────────────────────
+	if opts.engine == "" {
+		opts.engine = "keepalive"
 	}
-
-	// ── Step 5: Open FailedDB + result DB + run recrawler ──────────────────
-	fmt.Println(infoStyle.Render("Recrawling from origin servers..."))
 	if err := os.MkdirAll(filepath.Dir(failedDBPath), 0755); err != nil {
 		return fmt.Errorf("creating recrawl data dir: %w", err)
 	}
-
-	// Open FailedDB for logging failed domains + URLs
-	failedDB, err := recrawler.OpenFailedDB(failedDBPath)
-	if err != nil {
-		return fmt.Errorf("opening failed db: %w", err)
-	}
-	defer func() {
-		if failedDB != nil {
-			failedDB.Close()
-		}
-	}()
-	failedDB.SetMeta("crawl_id", opts.crawlID)
-	failedDB.SetMeta("started_at", time.Now().Format(time.RFC3339))
-	fmt.Println(successStyle.Render(fmt.Sprintf("  FailedDB → %s", failedDBPath)))
-
-	rdb, err := recrawler.NewResultDB(resultDir, 8, opts.batchSize, 0)
-	if err != nil {
-		return fmt.Errorf("opening result db: %w", err)
-	}
-	defer func() {
-		if rdb != nil {
-			_ = rdb.Close()
-		}
-	}()
-	fmt.Println(successStyle.Render(fmt.Sprintf("  Results → %s/ (8 shards)", resultDir)))
-
-	rdb.SetMeta(ctx, "crawl_id", opts.crawlID)
-	rdb.SetMeta(ctx, "seed_source", "cc-index")
-	if sourceParquetPath != "" {
-		rdb.SetMeta(ctx, "seed_parquet_path", sourceParquetPath)
-		rdb.SetMeta(ctx, "seed_parquet_subset", cc.ParquetSubsetFromPath(sourceParquetPath))
-	}
-	rdb.SetMeta(ctx, "started_at", time.Now().Format(time.RFC3339))
-	rdb.SetMeta(ctx, "workers", fmt.Sprintf("%d", opts.workers))
-
-	// Log DNS-dead domains to FailedDB (before recrawler runs)
-	if dnsResolver != nil {
-		// Build per-host URL counts for DNS-stage metadata (DNS prefetch operates on URL hosts).
-		hostCounts := make(map[string]int, len(seeds))
-		for _, s := range seeds {
-			host := strings.TrimSpace(s.Host)
-			if host == "" {
-				host = strings.TrimSpace(s.Domain)
-			}
-			if host != "" {
-				hostCounts[host]++
-			}
-		}
-
-		for host, errMsg := range dnsResolver.DeadDomainsWithErrors() {
-			reason := "dns_nxdomain"
-			if errMsg == "http_dead" {
-				reason = "http_dead"
-			}
-			failedDB.AddDomain(recrawler.FailedDomain{
-				Domain:   host,
-				Reason:   reason,
-				Error:    errMsg,
-				URLCount: hostCounts[host],
-				Stage:    "dns_batch",
-			})
-		}
-		for host, errMsg := range dnsResolver.TimeoutDomainsWithErrors() {
-			failedDB.AddDomain(recrawler.FailedDomain{
-				Domain:   host,
-				Reason:   "dns_timeout",
-				Error:    errMsg,
-				URLCount: hostCounts[host],
-				Stage:    "dns_batch",
-			})
-		}
-	}
-
-	// Create stats + recrawler
-	label := fmt.Sprintf("cc-%s", opts.crawlID)
-	stats := recrawler.NewStats(len(seeds), uniqueDomains, label)
-
-	fetchMode := "full"
-	if opts.statusOnly {
-		fetchMode = "status-only"
-	} else if opts.headOnly {
-		fetchMode = "head-only"
-	}
-	pipeline := "direct"
-	if dnsResolver != nil {
-		pipeline = "batch-dns → direct"
-	}
-	fmt.Println(infoStyle.Render(fmt.Sprintf("  %d workers, %v timeout, mode=%s, shards=%d, pipeline=%s",
-		opts.workers, recrawlCfg.Timeout, fetchMode, opts.transportShards, pipeline)))
-	if dnsResolver != nil {
-		if recrawlCfg.DNSWorkers > 0 {
-			fmt.Println(labelStyle.Render(fmt.Sprintf("  dns-workers=%d, dns-timeout=%v", recrawlCfg.DNSWorkers, recrawlCfg.DNSTimeout)))
-		} else {
-			fmt.Println(labelStyle.Render(fmt.Sprintf("  dns-prefetch cache-only (dns-timeout=%v)", recrawlCfg.DNSTimeout)))
-		}
-	}
-	if recrawlCfg.DomainFailThreshold > 0 {
-		fmt.Println(labelStyle.Render(fmt.Sprintf("  domain-fail-threshold=%d", recrawlCfg.DomainFailThreshold)))
-	}
-	fmt.Println()
-
-	r := recrawler.New(recrawlCfg, stats, rdb)
-	r.SetFailedDB(failedDB)
-
-	// Pre-populate DNS cache with reasons (use SetDNSCache + SetDeadDomains, NOT SetDNSResolver)
-	if dnsResolver != nil {
-		reasons := dnsResolver.DeadOrTimeoutDomainsWithReasons()
-		r.SetDNSCache(dnsResolver.ResolvedIPs())
-		r.SetDeadHosts(reasons)
-	}
-
-	err = recrawler.RunWithDisplay(ctx, r, seeds, skip, stats)
-
-	// ── Optional timeout replay pass (correctness) ────────────────
-	rdb.Flush(ctx)
-	timeoutReplaySummary := ccTimeoutReplaySummary{}
-	if failedDB != nil {
-		failedDB.SetMeta("main_pass_finished_at", time.Now().Format(time.RFC3339))
-		if closeErr := failedDB.Close(); closeErr != nil {
-			return fmt.Errorf("closing failed db after main pass: %w", closeErr)
-		}
-		failedDB = nil
-	}
-
-	if err == nil && recrawlCfg.DomainFailThreshold > 0 {
-		replaySummary, replayErr := ccRunTimeoutKilledReplay(ctx, failedDBPath, rdb, seeds, skip, dnsResolver, recrawlCfg, label)
-		if replayErr != nil {
-			fmt.Println(warningStyle.Render(fmt.Sprintf("Timeout replay failed: %v", replayErr)))
-		} else {
-			timeoutReplaySummary = replaySummary
-			rdb.SetMeta(ctx, "timeout_replay_candidates", fmt.Sprintf("%d", replaySummary.Candidates))
-			rdb.SetMeta(ctx, "timeout_replay_recovered", fmt.Sprintf("%d", replaySummary.Recovered))
-			rdb.SetMeta(ctx, "timeout_replay_fatal_reclassified", fmt.Sprintf("%d", replaySummary.FatalReclassified))
-			rdb.SetMeta(ctx, "timeout_replay_still_failed", fmt.Sprintf("%d", replaySummary.RecheckFailed))
-			rdb.SetMeta(ctx, "timeout_replay_remaining_timeout_killed", fmt.Sprintf("%d", replaySummary.RemainingTimeoutKilled))
-		}
-	}
-
-	// ── Final: flush + save DNS cache + FailedDB summary ──────────
-	rdb.Flush(ctx)
-	rdb.SetMeta(ctx, "finished_at", time.Now().Format(time.RFC3339))
-
-	if dnsResolver != nil {
-		fmt.Print(infoStyle.Render("  Saving DNS cache..."))
-		saveStart := time.Now()
-		if saveErr := dnsResolver.SaveCache(dnsPath); saveErr != nil {
-			fmt.Println(warningStyle.Render(fmt.Sprintf(" failed: %v", saveErr)))
-		} else {
-			fmt.Println(successStyle.Render(fmt.Sprintf(" saved in %s → %s (live=%d, dead=%d, timeout=%d)",
-				time.Since(saveStart).Truncate(time.Millisecond), filepath.Base(dnsPath),
-				dnsResolver.LiveCount(), dnsResolver.DeadCount(), dnsResolver.TimeoutCount())))
-		}
-	}
-
-	// FailedDB summary
-	_ = ccFailedDBSetMeta(failedDBPath, "finished_at", time.Now().Format(time.RFC3339))
-	_, failedDomainCount, domainSummaryErr := recrawler.FailedDomainSummary(failedDBPath)
-	if domainSummaryErr != nil {
-		return fmt.Errorf("reading failed domain summary: %w", domainSummaryErr)
-	}
-	_, failedURLCount, urlSummaryErr := recrawler.FailedURLSummary(failedDBPath)
-	if urlSummaryErr != nil {
-		return fmt.Errorf("reading failed URL summary: %w", urlSummaryErr)
-	}
-	fmt.Println(infoStyle.Render(fmt.Sprintf("  FailedDB: %s domains, %s URLs → %s",
-		ccFmtInt64(int64(failedDomainCount)), ccFmtInt64(int64(failedURLCount)), filepath.Base(failedDBPath))))
-	if timeoutReplaySummary.Candidates > 0 {
-		fmt.Println(labelStyle.Render(fmt.Sprintf("  Timeout replay: candidates=%d, replayed=%d, recovered=%d, fatal=%d, still-failed=%d, remaining-timeout-killed=%d",
-			timeoutReplaySummary.Candidates, timeoutReplaySummary.ReplaySeeds, timeoutReplaySummary.Recovered,
-			timeoutReplaySummary.FatalReclassified, timeoutReplaySummary.RecheckFailed, timeoutReplaySummary.RemainingTimeoutKilled)))
-	}
-
-	// Close result shards before optional domain export (DuckDB file locks).
-	if rdb != nil {
-		if closeErr := rdb.Close(); closeErr != nil {
-			return fmt.Errorf("closing result db before domain export: %w", closeErr)
-		}
-		rdb = nil
-	}
-
-	var domainExportSummary ccDomainExportSummary
-	if sourceParquetPath != "" {
-		if os.Getenv("CC_RECRAWL_DOMAIN_EXPORT") != "1" {
-			fmt.Println(labelStyle.Render("  Domain parquet export: skipped (temporarily disabled; set CC_RECRAWL_DOMAIN_EXPORT=1 to enable)"))
-		} else {
-			exportSummary, exportErr := ccExportPerDomainRecrawlArtifacts(ctx, ccCfg, sourceParquetPath, resultDir, failedDBPath)
-			if exportErr != nil {
-				fmt.Println(warningStyle.Render(fmt.Sprintf("Domain folder export failed: %v", exportErr)))
-			} else {
-				domainExportSummary = exportSummary
-			}
-		}
-	}
-
-	fmt.Println()
-	if err != nil {
-		fmt.Println(warningStyle.Render(fmt.Sprintf("Recrawl finished with error: %v", err)))
-	} else {
-		fmt.Println(successStyle.Render("Recrawl complete!"))
-	}
-	fmt.Println(labelStyle.Render(fmt.Sprintf("  Results: %s/", resultDir)))
-	if domainExportSummary.ParquetFolder != "" {
-		fmt.Println(labelStyle.Render(fmt.Sprintf(
-			"  Domain folders: %s domains updated for parquet %s → %s",
-			ccFmtInt64(int64(domainExportSummary.DomainsUpdated)),
-			domainExportSummary.ParquetFolder,
-			domainExportSummary.RootDir,
-		)))
-	}
-	fmt.Println()
-
-	return err
+	return runCCRecrawlV3(ctx, opts, seeds, dnsResolver, resultDir, failedDBPath)
 }
 
 // runCCRecrawlV3 delegates crawling to a recrawl_v3 engine selected by opts.engine.
