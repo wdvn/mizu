@@ -1,6 +1,9 @@
 # spec/0627: CC Recrawl — Full Run p:0/200/400/600 + Error Report + Server2 Optimization
 
-**Status:** implementation
+**Status:** complete (commit a2b0d2a3)
+
+**Note:** CC-MAIN-2026-08 has 300 parquet files (indices 0–299); p:400 and p:600
+are out of range. Valid shards: p:0, p:100, p:200, p:299 (or any 4 in range).
 
 **Goal:** Run `cc recrawl` for parquet files p:0, p:200, p:400, p:600 on both servers;
 add error breakdown + top failing domains to the end-of-run report;
