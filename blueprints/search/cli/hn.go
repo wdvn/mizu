@@ -707,7 +707,7 @@ and adaptive timeouts.`,
 	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 5000, "Pass-2 timeout for retrying http_timeout URLs (ms); 0=disabled")
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs (faster; may miss slow-but-live servers)")
 	cmd.Flags().StringVar(&writerMode, "writer", "duckdb", "Result writer backend: duckdb (default), bin (non-blocking NDJSON→DuckDB drain), devnull (benchmark only)")
-	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "batch", "Chunk mode: stream|batch|pipeline")
+	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "stream", "Chunk mode: stream|batch|pipeline (stream: sort-then-stream, lower memory; batch: N-domain chunks)")
 	cmd.Flags().IntVar(&chunkSize, "chunk-size", 0, "Override batch domain count (0=auto)")
 	cmd.Flags().IntVar(&pprofPort, "pprof-port", 0, "Enable pprof HTTP server on this port (0=off)")
 	cmd.Flags().StringVar(&bodyStoreDir, "body-store", "", "Body CAS store dir (default: $dataDir/bodies)")
