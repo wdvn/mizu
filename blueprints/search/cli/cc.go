@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/debug"
 	"sort"
 	"strconv"
 	"strings"
@@ -1375,14 +1376,12 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		jcfg.DomainTimeout = time.Duration(opts.domainTimeoutMs) * time.Millisecond
 	}
 
-	// Convert recrawler.SeedURL to crawl.SeedURL (structurally identical).
-	crawlSeeds := make([]crawl.SeedURL, len(seeds))
-	for i, s := range seeds {
-		crawlSeeds[i] = crawl.SeedURL{URL: s.URL, Domain: s.Domain, Host: s.Host}
-	}
+	// recrawler.SeedURL is a type alias for crawl.SeedURL — no conversion needed.
+	runtime.GC()
+	debug.FreeOSMemory()
 
 	return runRecrawlJob(ctx, recrawlJobArgs{
-		Seeds:        crawlSeeds,
+		Seeds:        seeds,
 		DNSCache:     dnsCache,
 		JobCfg:       jcfg,
 		ResultDir:    resultDir,
