@@ -218,9 +218,17 @@ CC_RECRAWL_FLAGS ?= --domain-fail-threshold 0 --domain-timeout 0 --batch-size 50
 remote-cc-recrawl-p0: ## Launch cc recrawl --file p:0 in background (~/cc-p0.log)
 	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:0 $(CC_RECRAWL_FLAGS) >~/cc-p0.log 2>&1 & echo PID:$$!'
 
+.PHONY: remote-cc-recrawl-p100
+remote-cc-recrawl-p100: ## Launch cc recrawl --file p:100 in background (~/cc-p100.log)
+	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:100 $(CC_RECRAWL_FLAGS) >~/cc-p100.log 2>&1 & echo PID:$$!'
+
 .PHONY: remote-cc-recrawl-p200
 remote-cc-recrawl-p200: ## Launch cc recrawl --file p:200 in background (~/cc-p200.log)
 	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:200 $(CC_RECRAWL_FLAGS) >~/cc-p200.log 2>&1 & echo PID:$$!'
+
+.PHONY: remote-cc-recrawl-p299
+remote-cc-recrawl-p299: ## Launch cc recrawl --file p:299 in background (~/cc-p299.log)
+	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:299 $(CC_RECRAWL_FLAGS) >~/cc-p299.log 2>&1 & echo PID:$$!'
 
 .PHONY: remote-cc-recrawl-p400
 remote-cc-recrawl-p400: ## Launch cc recrawl --file p:400 in background (~/cc-p400.log)
@@ -238,21 +246,21 @@ remote-cc-recrawl-all: remote-cc-recrawl-p0 remote-cc-recrawl-p200 \
 remote-cc-tail-p0: ## Tail cc recrawl p:0 log
 	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p0.log'
 
+.PHONY: remote-cc-tail-p100
+remote-cc-tail-p100: ## Tail cc recrawl p:100 log
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p100.log'
+
 .PHONY: remote-cc-tail-p200
 remote-cc-tail-p200: ## Tail cc recrawl p:200 log
 	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p200.log'
 
-.PHONY: remote-cc-tail-p400
-remote-cc-tail-p400: ## Tail cc recrawl p:400 log
-	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p400.log'
-
-.PHONY: remote-cc-tail-p600
-remote-cc-tail-p600: ## Tail cc recrawl p:600 log
-	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p600.log'
+.PHONY: remote-cc-tail-p299
+remote-cc-tail-p299: ## Tail cc recrawl p:299 log
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p299.log'
 
 .PHONY: remote-cc-status
-remote-cc-status: ## Show last 2 lines of all 4 cc recrawl logs
-	@$(SSH) $(REMOTE_SSH) 'tail -n2 ~/cc-p0.log ~/cc-p200.log ~/cc-p400.log ~/cc-p600.log 2>/dev/null'
+remote-cc-status: ## Show last 2 lines of all active cc recrawl logs
+	@$(SSH) $(REMOTE_SSH) 'tail -n2 ~/cc-p0.log ~/cc-p100.log ~/cc-p200.log ~/cc-p299.log 2>/dev/null'
 
 .PHONY: remote-hn-recrawl
 remote-hn-recrawl: ## Run hn recrawl (keepalive, auto-config) on remote server
