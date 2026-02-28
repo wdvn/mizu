@@ -381,19 +381,20 @@ func keepaliveFetchOne(ctx context.Context, client *http.Client,
 	bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 256*1024))
 	bodySize := max(resp.ContentLength, int64(len(bodyBytes)))
 
-	var title, description, language, body, bodyCID string
+	var title, description, language, bodyCID string
 	if resp.StatusCode == 200 && isHTML && len(bodyBytes) > 0 {
-		body = string(bodyBytes)
-		extracted := crawler.Extract(strings.NewReader(body), seed.URL)
+		bodyStr := string(bodyBytes)
+		extracted := crawler.Extract(strings.NewReader(bodyStr), seed.URL)
 		title = extracted.Title
 		description = extracted.Description
 		language = extracted.Language
 		if cfg.BodyStore != nil {
 			if cid, err := cfg.BodyStore.Put(bodyBytes); err == nil {
 				bodyCID = cid
-				body = "" // body is in CAS store; don't keep in Result
 			}
 		}
+		// Always discard body from Result (overflow string fix — Result.Body is always "").
+		// Bodies are only accessible via BodyCID when cfg.BodyStore is set.
 	}
 
 	return Result{
@@ -402,7 +403,6 @@ func keepaliveFetchOne(ctx context.Context, client *http.Client,
 		StatusCode:    resp.StatusCode,
 		ContentType:   ct,
 		ContentLength: bodySize,
-		Body:          body,
 		BodyCID:       bodyCID,
 		Title:         title,
 		Description:   description,
