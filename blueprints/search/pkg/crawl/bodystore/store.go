@@ -12,6 +12,10 @@ import (
 // Store is a content-addressable body store backed by the filesystem.
 // Bodies are stored gzip-compressed at {dir}/{sha[0:2]}/{sha[2:4]}/{sha[4:]}.gz.
 // The content ID (CID) format is "sha256:{hex64}".
+//
+// Concurrent Put calls with identical content are safe on POSIX systems:
+// each write goes to a unique .tmp file and os.Rename is atomic, so the last
+// rename wins and the result is always a valid file.
 type Store struct{ dir string }
 
 // Open returns a Store backed by dir, creating it if needed.
@@ -81,7 +85,11 @@ func (s *Store) Get(cid string) ([]byte, error) {
 		return nil, fmt.Errorf("bodystore: gzip open: %w", err)
 	}
 	defer gz.Close()
-	return io.ReadAll(gz)
+	b, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("bodystore: read: %w", err)
+	}
+	return b, nil
 }
 
 // Has reports whether the CID exists in the store.
