@@ -8,8 +8,6 @@ export function renderPage(): string {
 '  <link rel="preconnect" href="https://fonts.googleapis.com">\n' +
 '  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>\n' +
 '  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">\n' +
-'  <script src="https://cdn.jsdelivr.net/npm/marked@15/marked.min.js"><\/script>\n' +
-'  <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"><\/script>\n' +
 '  <style>\n' +
 '*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}\n' +
 ':root{\n' +
@@ -52,6 +50,9 @@ export function renderPage(): string {
 '.url-in:focus{border-color:var(--fg)}\n' +
 '.cvt-btn{font-family:var(--sans);font-size:13px;font-weight:500;padding:11px 20px;background:var(--fg);color:#fff;border:1px solid var(--fg);cursor:pointer;white-space:nowrap;transition:background .15s}\n' +
 '.cvt-btn:hover{background:#333;border-color:#333}\n' +
+'.examples{margin-top:10px;font-size:13px;color:var(--fg3)}\n' +
+'.eg{color:var(--fg2);cursor:pointer;text-decoration:underline;text-decoration-color:var(--border);transition:color .15s}\n' +
+'.eg:hover{color:var(--fg)}\n' +
 '\n' +
 '.agent-btn{width:100%;font-family:var(--sans);font-size:14px;font-weight:500;padding:14px 20px;background:#0a0a0a;color:#fff;border:1px solid #0a0a0a;cursor:pointer;display:flex;align-items:center;justify-content:center;gap:10px;transition:background .15s;margin-bottom:10px}\n' +
 '.agent-btn:hover{background:#222;border-color:#222}\n' +
@@ -151,6 +152,7 @@ export function renderPage(): string {
 '            <button type="submit" class="cvt-btn">Convert<\/button>\n' +
 '          <\/div>\n' +
 '        <\/form>\n' +
+'        <div class="examples">Try: <span class="eg" onclick="setEg(\'https://example.com\')">example.com<\/span> &middot; <span class="eg" onclick="setEg(\'https://news.ycombinator.com\')">news.ycombinator.com<\/span><\/div>\n' +
 '      <\/div>\n' +
 '      <div>\n' +
 '        <div class="cta-col-lbl">FOR YOUR AGENT<\/div>\n' +
@@ -338,10 +340,10 @@ export function renderPage(): string {
 '}\n' +
 '\n' +
 'function copyAgentInstructions() {\n' +
-'  var confirm = document.getElementById(\'agent-confirm\');\n' +
+'  var confirmEl = document.getElementById(\'agent-confirm\');\n' +
 '  function showConfirm() {\n' +
-'    confirm.style.display = \'block\';\n' +
-'    setTimeout(function() { confirm.style.display = \'none\'; }, 3000);\n' +
+'    confirmEl.style.display = \'block\';\n' +
+'    setTimeout(function() { confirmEl.style.display = \'none\'; }, 3000);\n' +
 '  }\n' +
 '  if (navigator.clipboard && navigator.clipboard.writeText) {\n' +
 '    navigator.clipboard.writeText(AGENT_INSTRUCTIONS).then(showConfirm).catch(function() {\n' +
@@ -376,7 +378,8 @@ export function renderPage(): string {
 'function copyBlock(panelId, btn) {\n' +
 '  var el = document.getElementById(panelId);\n' +
 '  if (!el) return;\n' +
-'  var text = el.innerText || el.textContent || \'\';\n' +
+'  var target = el.querySelector(\'pre\') || el;\n' +
+'  var text = target.innerText || target.textContent || \'\';\n' +
 '  var origText = btn.textContent;\n' +
 '  function done() {\n' +
 '    btn.textContent = \'copied!\';\n' +
