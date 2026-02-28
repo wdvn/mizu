@@ -15,9 +15,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-mizu/mizu/blueprints/search/pkg/archived/recrawler"
 	crawl "github.com/go-mizu/mizu/blueprints/search/pkg/crawl"
-	"github.com/go-mizu/mizu/blueprints/search/pkg/crawl/bodystore"
+	"github.com/go-mizu/mizu/blueprints/search/pkg/crawl/store"
 	"github.com/go-mizu/mizu/blueprints/search/pkg/hn"
 	"github.com/spf13/cobra"
 )
@@ -719,9 +718,7 @@ and adaptive timeouts.`,
 }
 
 // runHNRecrawlV3 runs the v3 recrawl engine for HN seeds.
-// It mirrors the structure of runCCRecrawlV3 but uses HN-specific result paths.
-// Pass 1 uses the configured timeout. Pass 2 (unless --no-retry) retries
-// http_timeout URLs with retryTimeoutMs to eliminate false negatives.
+// It builds the job configuration from HN-specific settings and delegates to runRecrawlJob.
 func runHNRecrawlV3(ctx context.Context,
 	hnCfg hn.Config,
 	seedRes *hn.RecrawlSeedResult,
@@ -741,18 +738,13 @@ func runHNRecrawlV3(ctx context.Context,
 	printAutoConfig bool,
 ) error {
 
-	eng, err := crawl.New(engineName)
-	if err != nil {
-		return fmt.Errorf("engine %q: %w", engineName, err)
-	}
-
 	// ── Hardware profile ──────────────────────────────────────────────────────
 	siCache := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), ".sysinfo.json")
 	si := crawl.LoadOrGatherSysInfo(siCache, 30*time.Minute)
 	fmt.Print(infoStyle.Render("Hardware Profile") + "\n")
 	fmt.Print(si.Table())
 
-	// Set GOMEMLIMIT to 75% of available RAM (overrides wrapper's fixed 2 GB).
+	// Set GOMEMLIMIT to 75% of available RAM.
 	if autoMem := si.MemAvailableMB * 1024 * 1024 * 75 / 100; autoMem > 0 {
 		debug.SetMemoryLimit(autoMem)
 		fmt.Printf("  GOMEMLIMIT     %s (auto-set from avail RAM)\n", crawl.FormatMB(si.MemAvailableMB*75/100))
@@ -768,7 +760,6 @@ func runHNRecrawlV3(ctx context.Context,
 		}
 		fmt.Printf("  %s  %s\n", infoStyle.Render("Auto-config:"), labelStyle.Render(reason))
 	} else if maxConnsPerDomain <= 0 {
-		// Workers explicitly set but innerN still auto.
 		innerN := si.CPUCount * 2
 		if innerN < 4 {
 			innerN = 4
@@ -780,10 +771,10 @@ func runHNRecrawlV3(ctx context.Context,
 	}
 
 	// Compute adaptive DB + writer settings (0 = auto).
+	availMB := int(si.MemAvailableMB)
 	if dbShards <= 0 {
 		dbShards = crawl.AutoShardCount(si.CPUCount)
 	}
-	availMB := int(si.MemAvailableMB)
 	if dbMemMB <= 0 {
 		dbMemMB = crawl.AutoDuckMemPerShard(availMB, dbShards)
 	}
@@ -803,41 +794,23 @@ func runHNRecrawlV3(ctx context.Context,
 	if printAutoConfig {
 		return nil
 	}
-	// ─────────────────────────────────────────────────────────────────────────
 
-	cfg := crawl.DefaultConfig()
-	cfg.Workers = workers
-	cfg.Timeout = time.Duration(timeoutMs) * time.Millisecond
-	cfg.StatusOnly = statusOnly
-	cfg.InsecureTLS = true
-	cfg.MaxConnsPerDomain = maxConnsPerDomain
-	if domainFailThreshold >= 0 {
-		cfg.DomainFailThreshold = domainFailThreshold
-	}
-	if domainTimeoutMs > 0 {
-		cfg.DomainTimeout = time.Duration(domainTimeoutMs) * time.Millisecond
-	}
-	if selfBin, execErr := os.Executable(); execErr == nil {
-		cfg.SearchBinary = selfBin
-	}
-
-	// Load seeds from seed DB
+	// ── Load seeds ────────────────────────────────────────────────────────────
 	fmt.Println(infoStyle.Render("Loading seeds into memory..."))
-	seeds, err := recrawler.LoadSeedURLs(ctx, seedRes.OutDBPath, int(seedRes.Rows))
+	seeds, err := store.LoadSeedURLs(ctx, seedRes.OutDBPath, int(seedRes.Rows))
 	if err != nil {
 		return fmt.Errorf("load seed URLs: %w", err)
 	}
 	fmt.Printf("  Loaded %s seed URLs\n\n", labelStyle.Render(formatInt64Exact(int64(len(seeds)))))
 
-	// DNS pre-resolution: resolve all unique hosts, skip NXDOMAIN domains.
+	// ── DNS pre-resolution ────────────────────────────────────────────────────
 	var dnsCache crawl.DNSCache
 	dnsCachePath := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "dns.duckdb")
 	if dnsWorkers > 0 {
-		resolver := recrawler.NewDNSResolver(time.Duration(dnsTimeoutMs) * time.Millisecond)
+		resolver := store.NewDNSResolver(time.Duration(dnsTimeoutMs) * time.Millisecond)
 		if cached, _ := resolver.LoadCache(dnsCachePath); cached > 0 {
 			fmt.Printf("  DNS cache: loaded %d entries\n", cached)
 		}
-		// Collect unique hosts (seeds only have domain set, not host)
 		hostSet := make(map[string]struct{}, seedRes.UniqueDomains)
 		for _, s := range seeds {
 			if h := s.Domain; h != "" {
@@ -848,13 +821,12 @@ func runHNRecrawlV3(ctx context.Context,
 		for h := range hostSet {
 			hostList = append(hostList, h)
 		}
-		// Only resolve hosts not yet in cache
 		cov := ccDNSCacheCoverage(resolver, hostList)
 		if cov.Pending > 0 {
 			fmt.Printf("  DNS resolving %s unique hosts (%d workers, %dms timeout)...\n",
 				labelStyle.Render(formatInt64Exact(int64(cov.Pending))), dnsWorkers, dnsTimeoutMs)
 			resolver.ResolveBatch(ctx, hostList, dnsWorkers, time.Duration(dnsTimeoutMs)*time.Millisecond,
-				func(_ recrawler.DNSProgress) {})
+				func(_ store.DNSProgress) {})
 			if saveErr := resolver.SaveCache(dnsCachePath); saveErr == nil {
 				fmt.Printf("  DNS saved: %s live  %s dead  %s timeout\n",
 					labelStyle.Render(formatInt64Exact(resolver.LiveCount())),
@@ -865,7 +837,6 @@ func runHNRecrawlV3(ctx context.Context,
 		} else {
 			fmt.Printf("  DNS cache: all %d hosts covered\n", len(hostList))
 		}
-		// Filter seeds: skip NXDOMAIN and DNS-timeout domains
 		before := len(seeds)
 		filtered := seeds[:0]
 		for _, s := range seeds {
@@ -874,491 +845,56 @@ func runHNRecrawlV3(ctx context.Context,
 			}
 		}
 		seeds = filtered
-		skippedDNS := before - len(seeds)
-		if skippedDNS > 0 {
+		if skippedDNS := before - len(seeds); skippedDNS > 0 {
 			fmt.Printf("  Filtered %s dead/timeout seeds → %s remaining\n\n",
 				labelStyle.Render(formatInt64Exact(int64(skippedDNS))),
 				labelStyle.Render(formatInt64Exact(int64(len(seeds)))),
 			)
 		}
-		dnsCache = crawl.WrapDNSResolver(resolver)
+		dnsCache = resolver.Cache()
 	}
 	if dnsCache == nil {
 		dnsCache = &crawl.NoopDNS{}
 	}
 
+	// ── Build job config ──────────────────────────────────────────────────────
 	resultDir := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "results")
 	failedDBPath := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "failed.duckdb")
-	if err := os.MkdirAll(resultDir, 0o755); err != nil {
-		return fmt.Errorf("create result dir: %w", err)
+
+	jcfg := crawl.JobConfig{
+		Engine:              engineName,
+		Workers:             workers,
+		MaxConnsPerDomain:   maxConnsPerDomain,
+		Timeout:             time.Duration(timeoutMs) * time.Millisecond,
+		RetryTimeout:        time.Duration(retryTimeoutMs) * time.Millisecond,
+		NoRetry:             noRetry,
+		StatusOnly:          statusOnly,
+		InsecureTLS:         true,
+		DomainFailThreshold: domainFailThreshold,
+		BatchSize:           batchSize,
+		ChunkMode:           chunkMode,
+		ChunkSize:           chunkSize,
+		SeedPath:            seedRes.OutDBPath,
+		Pass2Workers:        p2Workers,
 	}
-	cfg.SwarmResultDir = resultDir
-	cfg.SwarmFailedDir = hnCfg.WithDefaults().RecrawlDir()
-	cfg.BatchSize = batchSize
-
-	// ── Writer setup (--writer duckdb | bin | devnull) ────────────────────────
-	// devnull: no DB files, no pass 2 — pure throughput benchmark.
-	// bin:     non-blocking NDJSON segments, drained to DuckDB in background.
-	// duckdb:  direct DuckDB writes (original behaviour).
-	writerMode = strings.TrimSpace(strings.ToLower(writerMode))
-	if writerMode == "" {
-		writerMode = "duckdb"
-	}
-
-	var (
-		rdb         *recrawler.ResultDB
-		failedDB    *recrawler.FailedDB
-		failedDBDone bool
-		binWriter   *crawl.BinSegWriter
-	)
-
-	if writerMode != "devnull" {
-		var err error
-		rdb, err = recrawler.NewResultDB(resultDir, dbShards, batchSize, dbMemMB)
-		if err != nil {
-			return fmt.Errorf("opening result db: %w", err)
-		}
-		defer rdb.Close()
-
-		failedDB, err = recrawler.OpenFailedDB(failedDBPath)
-		if err != nil {
-			return fmt.Errorf("opening failed db: %w", err)
-		}
-		defer func() {
-			if !failedDBDone {
-				failedDB.Close()
-			}
-		}()
+	if domainTimeoutMs > 0 {
+		jcfg.DomainTimeout = time.Duration(domainTimeoutMs) * time.Millisecond
 	}
 
-	// Print config summary
-	bodyMode := "full-body (256 KB limit)"
-	if cfg.StatusOnly {
-		bodyMode = "status-only"
-	}
-	domainFail := "disabled"
-	if cfg.DomainFailThreshold > 0 {
-		effectiveRounds := cfg.DomainFailThreshold * max(cfg.MaxConnsPerDomain, 1)
-		domainFail = fmt.Sprintf("abandon after %d total timeouts (%d rounds × %d conns)",
-			effectiveRounds, cfg.DomainFailThreshold, cfg.MaxConnsPerDomain)
-	}
-	writerLabel := writerMode
-	switch writerMode {
-	case "bin":
-		writerLabel = "bin  (NDJSON segments → DuckDB drain)"
-	case "devnull":
-		writerLabel = "devnull  (benchmark only — no data saved, no pass 2)"
-	}
-	fmt.Printf("  Engine            %s\n", engineName)
-	fmt.Printf("  Workers           %s\n", ccFmtInt64(int64(cfg.Workers)))
-	fmt.Printf("  Max Conns/Domain  %d\n", cfg.MaxConnsPerDomain)
-	fmt.Printf("  Timeout           %v (adaptive P95×2)  [pass 1]\n", cfg.Timeout)
-	if !noRetry && retryTimeoutMs > 0 && writerMode != "devnull" {
-		fmt.Printf("  Retry Timeout     %v  [pass 2 for http_timeout URLs]\n", time.Duration(retryTimeoutMs)*time.Millisecond)
-	}
-	if cfg.DomainTimeout > 0 {
-		fmt.Printf("  Domain Timeout    %v (cancel remaining URLs per domain after this)\n", cfg.DomainTimeout)
-	}
-	fmt.Printf("  Domain Fail       %s\n", domainFail)
-	fmt.Printf("  Body              %s\n", bodyMode)
-	fmt.Printf("  TLS               skip-verify\n")
-	fmt.Printf("  Seeds             %s URLs\n", ccFmtInt64(int64(len(seeds))))
-	fmt.Printf("  Writer            %s\n", writerLabel)
-	if writerMode != "devnull" {
-		fmt.Printf("  FailedDB          %s\n", failedDBPath)
-		fmt.Printf("  Results           %s/ (%d shards)\n", resultDir, dbShards)
-	}
-	fmt.Println()
-
-	ls := &v3LiveStats{slowDomainMs: slowDomainMs}
-	cfg.Notifier = ls
-	// For swarm engine: relay live drone stats directly to display atomics.
-	if engineName == "swarm" {
-		cfg.ProgressFunc = func(ok, failed, timeout int64) {
-			ls.ok.Store(ok)
-			ls.failed.Store(failed)
-			ls.timeout.Store(timeout)
-			ls.total.Store(ok + failed + timeout)
-		}
-	}
-
-	// Start hardware monitor for disk/network throughput display.
-	hwmon := crawl.NewHWMonitor(2 * time.Second)
-	defer hwmon.Stop()
-	ls.hwmon = hwmon
-
-	// Build the ResultWriter for pass 1.
-	var resultWriter crawl.ResultWriter
-	switch writerMode {
-	case "bin":
-		segDir := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "segments")
-		// Drain any leftover segment files from a previous crashed run.
-		if n, err := crawl.DrainLeftovers(segDir, rdb); err != nil {
-			fmt.Fprintf(os.Stderr, "  [warn] drain leftovers: %v\n", err)
-		} else if n > 0 {
-			fmt.Printf("  Recovered %s records from leftover segments\n", labelStyle.Render(formatInt64Exact(n)))
-		}
-		var bwErr error
-		binWriter, bwErr = crawl.NewBinSegWriter(segDir, 0, int(si.MemAvailableMB), rdb)
-		if bwErr != nil {
-			return fmt.Errorf("creating bin writer: %w", bwErr)
-		}
-		defer binWriter.Close()
-		ls.binWriter = binWriter
-		resultWriter = binWriter
-	case "devnull":
-		resultWriter = &crawl.DevNullResultWriter{}
-	default: // "duckdb"
-		resultWriter = &crawl.ResultDBWriter{DB: rdb}
-	}
-
-	var failureWriter crawl.FailureWriter
-	if writerMode == "devnull" {
-		failureWriter = &crawl.DevNullFailureWriter{}
-	} else {
-		failureWriter = &crawl.FailedDBWriter{DB: failedDB}
-	}
-
-	pw := &v3ProgressWriter{
-		inner: resultWriter,
-		ls:    ls,
-	}
-	fw := &v3ProgressFailureWriter{
-		inner: failureWriter,
-		ls:    ls,
-	}
-
-	stdoutStat, statErr := os.Stdout.Stat()
-	isTTY := statErr == nil && stdoutStat.Mode()&os.ModeCharDevice != 0
-	progressInterval := 500 * time.Millisecond
-	if !isTTY {
-		progressInterval = 2 * time.Second
-	}
-
-	// Open body store
-	bsDir := bodyStoreDir
-	if bsDir == "" {
-		bsDir = filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "bodies")
-	}
-	bs, bsErr := bodystore.Open(bsDir)
-	if bsErr != nil {
-		return fmt.Errorf("open body store: %w", bsErr)
-	}
-	fmt.Printf("  Body store:    %s\n", labelStyle.Render(bsDir))
-	cfg.BodyStore = bs
-
-	progressCtx, cancelProgress := context.WithCancel(ctx)
-	defer cancelProgress()
-	progressDone := make(chan struct{})
-	start := time.Now()
-	seedTotal := int64(len(seeds))
-
-	go func() {
-		defer close(progressDone)
-		ticker := time.NewTicker(progressInterval)
-		defer ticker.Stop()
-		var displayLines int
-		for {
-			select {
-			case <-progressCtx.Done():
-				return
-			case t := <-ticker.C:
-				ls.updateSpeed(t)
-				output := v3RenderProgress(ls, cfg, engineName, seedTotal, start, isTTY)
-				if isTTY {
-					if displayLines > 0 {
-						fmt.Printf("\033[%dA\033[J", displayLines)
-					}
-					fmt.Print(output)
-					displayLines = strings.Count(output, "\n")
-				} else {
-					fmt.Print(output)
-				}
-			}
-		}
-	}()
-
-	// Run engine with chunk-mode switch.
-	mode := chunkMode
-	if mode == "" {
-		mode = "batch"
-	}
-
-	benchDataDir := hnCfg.WithDefaults().RecrawlDir()
-	bt := crawl.NewBenchTracker(mode)
-
-	var stats *crawl.Stats
-	var runErr error
-
-	switch mode {
-	case "batch":
-		si := crawl.LoadOrGatherSysInfo("", 0)
-		batchDomains := chunkSize
-		if batchDomains <= 0 {
-			batchDomains = crawl.AutoBatchDomains(int(si.MemAvailableMB), 3, 256)
-		}
-		fmt.Printf("  Chunk mode:    batch (%d domains/batch)\n", batchDomains)
-
-		// Group seeds by domain.
-		domainMap := make(map[string][]recrawler.SeedURL)
-		for _, s := range seeds {
-			domainMap[s.Domain] = append(domainMap[s.Domain], s)
-		}
-		domainKeys := make([]string, 0, len(domainMap))
-		for d := range domainMap {
-			domainKeys = append(domainKeys, d)
-		}
-
-		totalBatches := (len(domainKeys) + batchDomains - 1) / batchDomains
-		for start := 0; start < len(domainKeys); start += batchDomains {
-			end := min(start+batchDomains, len(domainKeys))
-			var batchSeeds []recrawler.SeedURL
-			for _, d := range domainKeys[start:end] {
-				batchSeeds = append(batchSeeds, domainMap[d]...)
-			}
-			batchNum := start/batchDomains + 1
-			fmt.Printf("  Batch %d/%d: %d domains, %d seeds\n",
-				batchNum, totalBatches, end-start, len(batchSeeds))
-
-			batchStart := time.Now()
-			var batchStats *crawl.Stats
-			if batchStats, runErr = eng.Run(ctx, batchSeeds, dnsCache, cfg, pw, fw); runErr != nil && ctx.Err() == nil {
-				break
-			}
-			if batchStats != nil {
-				bt.RecordBatch(batchStats.OK, time.Since(batchStart))
-				if stats == nil {
-					stats = batchStats
-				} else {
-					stats.OK += batchStats.OK
-					stats.Total += batchStats.Total
-					stats.Failed += batchStats.Failed
-					stats.Bytes += batchStats.Bytes
-					if batchStats.PeakRPS > stats.PeakRPS {
-						stats.PeakRPS = batchStats.PeakRPS
-					}
-				}
-			}
-			if ctx.Err() != nil {
-				break
-			}
-			// Release ~2 GB DuckDB CGO pool between batches.
-			if rdb != nil {
-				if reopenErr := rdb.ReopenShards(); reopenErr != nil {
-					fmt.Fprintf(os.Stderr, "  [warn] ReopenShards: %v\n", reopenErr)
-				}
-			}
-			debug.FreeOSMemory()
-		}
-
-	case "stream":
-		si := crawl.LoadOrGatherSysInfo("", 0)
-		// Only auto-tune if --workers was not explicitly set.
-		if workers <= 0 {
-			cfg.Workers = crawl.AutoWorkersFull(int(si.MemAvailableMB), 256)
-		}
-		fmt.Printf("  Chunk mode:    stream (workers=%d)\n", cfg.Workers)
-		streamStart := time.Now()
-		stats, runErr = eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
-		if stats != nil {
-			bt.RecordBatch(stats.OK, time.Since(streamStart))
-		}
-
-	case "pipeline":
-		si2 := crawl.LoadOrGatherSysInfo("", 0)
-		batchDomains := chunkSize
-		if batchDomains <= 0 {
-			batchDomains = crawl.AutoBatchDomains(int(si2.MemAvailableMB), 3, 256)
-		}
-		fmt.Printf("  Chunk mode:    pipeline (%d domains/batch)\n", batchDomains)
-		pipeStart := time.Now()
-		var pipeStats *crawl.Stats
-		pipeStats, runErr = crawl.RunPipeline(ctx, crawl.PipelineConfig{
-			Cfg:       cfg,
-			DNS:       dnsCache,
-			Results:   pw,
-			Failures:  fw,
-			RDB:       rdb,
-			SeedPath:  seedRes.OutDBPath,
-			BatchSize: batchDomains,
-			AvailMB:   int(si2.MemAvailableMB),
-		})
-		stats = pipeStats
-		if stats != nil {
-			bt.RecordBatch(stats.OK, time.Since(pipeStart))
-		}
-
-	default:
-		fmt.Printf("  Chunk mode:    %s (fallback to stream)\n", mode)
-		stats, runErr = eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
-	}
-
-	// Save benchmark result for this mode.
-	if saveErr := bt.Save(benchDataDir); saveErr != nil {
-		fmt.Fprintf(os.Stderr, "  [warn] bench save: %v\n", saveErr)
-	}
-	cancelProgress()
-	<-progressDone
-
-	if isTTY {
-		fmt.Println()
-	}
-	if runErr != nil {
-		return fmt.Errorf("engine run: %w", runErr)
-	}
-	if stats == nil {
-		stats = &crawl.Stats{}
-	}
-
-	skipped := ls.skipped.Load()
-	skippedNote := ""
-	if skipped > 0 {
-		skippedNote = fmt.Sprintf("  skipped %s domain-killed", ccFmtInt64(skipped))
-	}
-	bw := ""
-	if b := ls.bytes.Load(); b > 0 {
-		bw = fmt.Sprintf("  |  %s total", v3FmtBytes(b))
-	}
-	passLabel := ""
-	if !noRetry && retryTimeoutMs > 0 {
-		passLabel = " (pass 1)"
-	}
-	fmt.Println(successStyle.Render(fmt.Sprintf(
-		"Engine %s done%s: %s ok / %s total | avg %.0f rps | peak %.0f rps | %s%s%s",
-		engineName, passLabel,
-		ccFmtInt64(stats.OK), ccFmtInt64(stats.Total),
-		stats.AvgRPS, stats.PeakRPS,
-		stats.Duration.Truncate(time.Second),
-		bw, skippedNote,
-	)))
-
-	// ── Pass 2: retry http_timeout URLs with a longer timeout ─────────────────
-	// Purpose: eliminate false negatives — servers that respond in 2–20s would be
-	// lost after pass 1's short timeout. Pass 2 gives them a fair chance.
-	// devnull mode skips pass 2 (no failedDB → no timeout URL tracking).
-	pass1OK := stats.OK // save before pass-2 merge for no-false-negative reporting
-	if !noRetry && retryTimeoutMs > 0 && writerMode != "devnull" && ctx.Err() == nil {
-		// DuckDB only allows one connection per file. Close pass-1 failedDB so
-		// LoadTimeoutURLs can open it read-only without a "conflicting lock" error.
-		failedDBDone = true
-		failedDB.Close()
-
-		retrySeeds, rErr := recrawler.LoadRetryURLs(failedDBPath)
-		if rErr != nil {
-			fmt.Printf("  %s loading timeout URLs for retry: %v\n", warningStyle.Render("warn:"), rErr)
-		} else if len(retrySeeds) > 0 {
-			fmt.Printf("\n%s  %s http_timeout + dns_timeout URLs → retrying at %dms timeout\n",
-				infoStyle.Render("Pass 2:"),
-				labelStyle.Render(formatInt64Exact(int64(len(retrySeeds)))),
-				retryTimeoutMs,
-			)
-
-			// Reopen failedDB for pass 2 failure writes (appends to same file).
-			// failedDB2 is nil if open fails — FailedDB methods are nil-safe.
-			failedDB2, _ := recrawler.OpenFailedDB(failedDBPath)
-			defer failedDB2.Close()
-
-			retryCfg := cfg
-			retryCfg.Timeout = time.Duration(retryTimeoutMs) * time.Millisecond
-			// Pass 2 uses the same worker count as pass 1 (or --pass2-workers override).
-			// Slow domains benefit from full concurrency — halving workers just slows recovery.
-			retryCfg.Workers = p2Workers
-			// Disable domain-kill in pass 2: every URL must get a fair attempt at the longer
-			// timeout. domain_http_timeout_killed URLs from pass 1 are now retried here, and we
-			// must not kill them again before they have a chance to respond.
-			retryCfg.DomainFailThreshold = 0
-			// Longer domain deadline for pass 2 (slow servers need time).
-			retryCfg.DomainTimeout = time.Duration(retryTimeoutMs*3) * time.Millisecond
-
-			ls2 := &v3LiveStats{slowDomainMs: slowDomainMs, binWriter: binWriter, hwmon: hwmon}
-			retryCfg.Notifier = ls2
-			// Pass 2 uses the same result writer as pass 1 (bin writers are reusable).
-			var p2ResultWriter crawl.ResultWriter
-			if writerMode == "bin" {
-				p2ResultWriter = binWriter // BinSegWriter stays open across passes
-			} else {
-				p2ResultWriter = &crawl.ResultDBWriter{DB: rdb}
-			}
-			pw2 := &v3ProgressWriter{inner: p2ResultWriter, ls: ls2}
-			fw2 := &v3ProgressFailureWriter{inner: &crawl.FailedDBWriter{DB: failedDB2}, ls: ls2}
-
-			retryStart := time.Now()
-			retryTotal := int64(len(retrySeeds))
-
-			progressCtx2, cancelProgress2 := context.WithCancel(ctx)
-			progressDone2 := make(chan struct{})
-			go func() {
-				defer close(progressDone2)
-				ticker := time.NewTicker(progressInterval)
-				defer ticker.Stop()
-				var displayLines int
-				for {
-					select {
-					case <-progressCtx2.Done():
-						return
-					case t := <-ticker.C:
-						ls2.updateSpeed(t)
-						output := v3RenderProgress(ls2, retryCfg, engineName, retryTotal, retryStart, isTTY)
-						if isTTY {
-							if displayLines > 0 {
-								fmt.Printf("\033[%dA\033[J", displayLines)
-							}
-							fmt.Print(output)
-							displayLines = strings.Count(output, "\n")
-						} else {
-							fmt.Print(output)
-						}
-					}
-				}
-			}()
-
-			eng2, _ := crawl.New(engineName)
-			retryStats, _ := eng2.Run(ctx, retrySeeds, dnsCache, retryCfg, pw2, fw2)
-			cancelProgress2()
-			<-progressDone2
-
-			if retryStats != nil {
-				if isTTY {
-					fmt.Println()
-				}
-				fmt.Println(successStyle.Render(fmt.Sprintf(
-					"Pass 2 done: %s rescued / %s retried | avg %.0f rps | %s",
-					ccFmtInt64(retryStats.OK), ccFmtInt64(retryStats.Total),
-					retryStats.AvgRPS, retryStats.Duration.Truncate(time.Second),
-				)))
-				// Merge into pass-1 stats for final totals
-				stats.OK += retryStats.OK
-				stats.Total += retryStats.Total
-				stats.Failed += retryStats.Failed
-				stats.Bytes += retryStats.Bytes
-
-				// Report false negatives rescued by pass 2
-				falseNegCount := retryStats.OK
-				bt.RecordFalseNeg(falseNegCount)
-				if saveErr := bt.Save(benchDataDir); saveErr != nil {
-					fmt.Fprintf(os.Stderr, "  [warn] bench save (pass 2): %v\n", saveErr)
-				}
-				if falseNegCount > 0 {
-					fmt.Printf("  %s  false negatives rescued by pass 2: %s\n",
-						successStyle.Render("↑"),
-						labelStyle.Render(ccFmtInt64(falseNegCount)))
-				}
-			}
-		} else {
-			fmt.Printf("\n%s  no timeout URLs to retry\n", infoStyle.Render("Pass 2:"))
-		}
-	}
-	// ─────────────────────────────────────────────────────────────────────────
-
-	if !noRetry && retryTimeoutMs > 0 {
-		rescued := stats.OK - pass1OK
-		fmt.Println(successStyle.Render(fmt.Sprintf(
-			"Combined total: %s ok / %s total | %s bytes | rescued=%s | 0 false negatives (≤%dms)",
-			ccFmtInt64(stats.OK), ccFmtInt64(stats.Total), v3FmtBytes(stats.Bytes),
-			ccFmtInt64(rescued), retryTimeoutMs,
-		)))
-	}
-	return nil
+	return runRecrawlJob(ctx, recrawlJobArgs{
+		Seeds:        seeds,
+		DNSCache:     dnsCache,
+		JobCfg:       jcfg,
+		ResultDir:    resultDir,
+		FailedDBPath: failedDBPath,
+		WriterMode:   writerMode,
+		SlowDomainMs: slowDomainMs,
+		SegSizeMB:    segSizeMB,
+		BodyStoreDir: bodyStoreDir,
+		DBShards:     dbShards,
+		DBMemMB:      dbMemMB,
+		SysInfo:      si,
+	})
 }
 
 func runHNSyncOnce(ctx context.Context, cmd *cobra.Command, run int) error {
