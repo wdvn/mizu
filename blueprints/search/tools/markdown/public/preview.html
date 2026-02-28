@@ -14,41 +14,47 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <link rel="stylesheet" href="/styles.css">
   <style>
-.top-bar{width:100%;border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:12px;background:var(--bg)}
-.top-bar .logo-sq{flex-shrink:0}
+/* top bar — sticky, no border */
+.top-bar{width:100%;padding:10px 20px;display:flex;align-items:center;gap:12px;background:var(--bg);position:sticky;top:0;z-index:50}
+.prev-logo{display:flex;align-items:center;color:var(--fg);flex-shrink:0}
 .url-form{flex:1;display:flex;max-width:860px}
+
+/* theme toggle always visible top-right */
+.top-bar .theme-toggle{margin-left:auto}
 
 /* empty state */
 .empty-state{display:none;padding:100px 32px;text-align:center}
-.empty-txt{font-size:14px;color:var(--fg3);margin-bottom:14px}
+.empty-txt{font-size:15px;color:var(--fg3);margin-bottom:14px}
 .empty-links{font-size:13px;color:var(--fg3)}
 .empty-eg{color:var(--fg2);cursor:pointer;text-decoration:underline;text-decoration-color:var(--border2);transition:color .15s}
 .empty-eg:hover{color:var(--fg)}
-.empty-icon{width:40px;height:40px;margin:0 auto 20px;color:var(--fg3)}
+.empty-icon{width:44px;height:44px;margin:0 auto 20px;color:var(--fg3)}
 
-/* loading / error states */
-.loading-state{display:none;padding:80px 32px;text-align:center}
-.loading-txt{font-size:14px;color:var(--fg3);vertical-align:middle;margin-left:10px}
+/* loading state */
+.loading-state{display:none;padding:80px 32px;flex-direction:column;align-items:center;gap:14px}
+.loading-txt{font-size:14px;color:var(--fg3)}
+
+/* error / result */
 .error-state{display:none;padding:32px}
-.error-box{max-width:var(--w);margin:0 auto;background:var(--bg2);border:1px solid var(--border2);padding:16px 20px;font-size:14px;color:var(--fg2)}
+.error-box{max-width:var(--w);margin:0 auto;background:var(--bg2);padding:16px 20px;font-size:14px;color:var(--fg2)}
 .result-state{display:none}
 
 /* meta bar */
-.meta-bar{width:100%;padding:12px 32px;border-bottom:1px solid var(--border);background:var(--bg)}
+.meta-bar{width:100%;padding:10px 32px;background:var(--bg)}
 .meta-inner{max-width:var(--w);margin:0 auto;display:flex;align-items:center;gap:10px}
 .r-title{flex:1;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
 .r-raw{font-size:13px;color:var(--fg3);white-space:nowrap;flex-shrink:0;text-decoration:underline;text-decoration-color:var(--border2);transition:color .15s}
 .r-raw:hover{color:var(--fg)}
 
 /* tab bar */
-.tab-bar{width:100%;padding:0 32px;border-bottom:1px solid var(--border);background:var(--bg)}
+.tab-bar{width:100%;padding:0 32px;background:var(--bg)}
 .tab-bar-inner{max-width:var(--w);margin:0 auto;display:flex;align-items:center;justify-content:space-between}
 .tabs{display:flex}
-.tab{font-size:13px;padding:12px 16px;background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer;color:var(--fg3);transition:color .15s,border-color .15s;font-family:var(--sans)}
+.tab{font-size:13px;padding:10px 14px;background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer;color:var(--fg3);transition:color .15s,border-color .15s;font-family:var(--sans)}
 .tab.on{color:var(--fg);border-bottom-color:var(--fg)}
-.tab-actions{display:flex;gap:8px}
-.act-btn{font-family:var(--sans);font-size:13px;padding:7px 14px;background:var(--bg);color:var(--fg2);border:1px solid var(--border);cursor:pointer;transition:border-color .15s,color .15s}
-.act-btn:hover{border-color:var(--border2);color:var(--fg)}
+.tab-actions{display:flex;gap:6px}
+.act-btn{font-family:var(--sans);font-size:13px;padding:6px 14px;background:var(--bg2);color:var(--fg2);border:none;cursor:pointer;transition:background .15s,color .15s}
+.act-btn:hover{background:var(--border2);color:var(--fg)}
 
 /* panels */
 .panel{display:none}
@@ -70,32 +76,32 @@
 #prev-out code{font-family:var(--mono);font-size:12px;background:var(--bg2);padding:1px 5px;color:var(--fg)}
 #prev-out pre{background:var(--code-bg);padding:20px;overflow-x:auto;margin-bottom:16px}
 #prev-out pre code{background:none;padding:0;color:var(--code-fg);font-size:13px}
-#prev-out blockquote{border-left:3px solid var(--border2);padding-left:16px;color:var(--fg3);margin-bottom:14px}
+#prev-out blockquote{padding-left:16px;color:var(--fg3);margin-bottom:14px}
 #prev-out a{color:var(--fg);text-decoration:underline;text-decoration-color:var(--border2)}
 #prev-out a:hover{text-decoration-color:var(--fg)}
 #prev-out table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:14px}
-#prev-out th,#prev-out td{border:1px solid var(--border2);padding:8px 12px;text-align:left;color:var(--fg2)}
+#prev-out th,#prev-out td{padding:8px 12px;text-align:left;color:var(--fg2)}
 #prev-out th{background:var(--bg2);font-weight:600;color:var(--fg)}
-#prev-out hr{border:none;border-top:1px solid var(--border);margin:24px 0}
+#prev-out hr{border:none;margin:24px 0}
 #prev-out img{max-width:100%;height:auto}
   </style>
 </head>
 <body>
 
 <div class="top-bar">
-  <a href="/" class="logo-sq" title="markdown.go-mizu">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--bg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+  <a href="/" class="prev-logo" title="markdown.go-mizu">
+    <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
       <rect x="3" y="3" width="18" height="18" rx="2"/>
       <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
     </svg>
   </a>
   <form class="url-form" id="form" onsubmit="handleSubmit(event)">
     <input id="url-in" type="url" class="url-in" placeholder="https://example.com" autocomplete="off" spellcheck="false">
-    <button type="submit" id="sub-btn" class="cvt-btn"><span id="btn-sp" style="display:none" class="spinner"></span><span id="btn-t">Convert</span></button>
+    <button type="submit" id="sub-btn" class="cvt-btn"><span id="btn-t">Convert</span></button>
   </form>
   <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
-    <svg id="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
-    <svg id="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+    <svg id="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
+    <svg id="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
   </button>
 </div>
 
@@ -109,7 +115,7 @@
 </div>
 
 <div class="loading-state" id="loading-state">
-  <span class="spinner" style="vertical-align:middle"></span>
+  <span class="spinner"></span>
   <span class="loading-txt">Converting…</span>
 </div>
 
@@ -167,8 +173,7 @@ function setPreviewEg(url) {
 function setLoading(v) {
   document.getElementById('sub-btn').disabled = v;
   document.getElementById('btn-t').textContent = v ? 'Converting…' : 'Convert';
-  document.getElementById('btn-sp').style.display = v ? '' : 'none';
-  document.getElementById('loading-state').style.display = v ? 'block' : 'none';
+  document.getElementById('loading-state').style.display = v ? 'flex' : 'none';
   document.getElementById('empty-state').style.display = 'none';
 }
 

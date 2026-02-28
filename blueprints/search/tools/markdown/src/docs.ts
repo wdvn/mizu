@@ -17,12 +17,12 @@ export function renderDocs(contentHtml: string): string {
   @media(max-width:640px){.doc-wrap{padding:32px 20px 60px}}
   .doc-wrap h1{font-size:32px;font-weight:700;letter-spacing:-.03em;margin-bottom:12px;color:var(--fg)}
   .doc-wrap>p:first-of-type{font-size:16px;color:var(--fg2);margin-bottom:40px;line-height:1.7}
-  .doc-wrap h2{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:0;scroll-margin-top:24px;color:var(--fg);padding:48px 0 14px;border-top:1px solid var(--border)}
-  .doc-wrap h2:first-of-type{padding-top:0;border-top:none}
+  .doc-wrap h2{font-size:20px;font-weight:600;letter-spacing:-.02em;margin:0;scroll-margin-top:24px;color:var(--fg);padding:48px 0 14px}
+  .doc-wrap h2:first-of-type{padding-top:0}
   .doc-wrap h3{font-size:16px;font-weight:600;margin:28px 0 10px;color:var(--fg)}
-  .doc-wrap p{font-size:15px;color:var(--fg2);line-height:1.75;margin-bottom:14px}
+  .doc-wrap p{font-size:16px;color:var(--fg2);line-height:1.75;margin-bottom:14px}
   .doc-wrap ul,.doc-wrap ol{padding-left:1.5em;margin-bottom:16px}
-  .doc-wrap li{font-size:15px;color:var(--fg2);margin:4px 0;line-height:1.7}
+  .doc-wrap li{font-size:16px;color:var(--fg2);margin:4px 0;line-height:1.7}
   .doc-wrap strong{color:var(--fg);font-weight:600}
   .doc-wrap a{color:var(--fg);text-decoration:underline;text-underline-offset:2px;text-decoration-color:var(--border2)}
   .doc-wrap a:hover{text-decoration-color:var(--fg)}
@@ -30,8 +30,8 @@ export function renderDocs(contentHtml: string): string {
   .doc-wrap pre{background:var(--code-bg);padding:20px 22px;overflow-x:auto;margin:16px 0;position:relative}
   .doc-wrap pre code{font-family:var(--mono);font-size:13px;line-height:1.7;color:var(--code-fg);background:none;padding:0}
   .doc-wrap table{width:100%;border-collapse:collapse;margin:16px 0;font-size:14px}
-  .doc-wrap th{text-align:left;padding:8px 14px;border-bottom:1px solid var(--border);font-weight:600;color:var(--fg)}
-  .doc-wrap td{padding:8px 14px;border-bottom:1px solid var(--border2);color:var(--fg2)}
+  .doc-wrap th{text-align:left;padding:8px 14px;font-weight:600;color:var(--fg)}
+  .doc-wrap td{padding:8px 14px;color:var(--fg2)}
   .doc-wrap pre .copy-btn{position:absolute;top:10px;right:10px}
   </style>
 </head>
@@ -39,20 +39,18 @@ export function renderDocs(contentHtml: string): string {
 <header>
   <div class="hdr">
     <a href="/" class="logo">
-      <span class="logo-sq">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--bg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="18" height="18" rx="2"/>
-          <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
-        </svg>
-      </span>
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="2"/>
+        <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
+      </svg>
       markdown.go-mizu
     </a>
     <nav>
       <a href="/">Home</a>
       <a href="https://github.com/go-mizu/mizu">GitHub</a>
       <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
-        <svg id="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
-        <svg id="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg id="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
+        <svg id="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
       </button>
     </nav>
   </div>

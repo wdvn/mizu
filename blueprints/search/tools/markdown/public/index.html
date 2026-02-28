@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>URL → Markdown</title>
-  <meta name="description" content="Convert any URL to clean Markdown. No API key. No account. Free. Built for AI agents and LLM pipelines.">
+  <title>URL → Markdown — markdown.go-mizu</title>
+  <meta name="description" content="Convert any URL to clean Markdown. Free, instant, no account required. Built for AI agents and LLM pipelines.">
   <script>
   (function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t);})();
   </script>
@@ -13,52 +13,47 @@
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/styles.css">
   <style>
-/* landing */
-.hero{padding:80px 0 72px}
-.hero h1{font-size:clamp(44px,6vw,72px);font-weight:700;letter-spacing:-.04em;line-height:1.05;margin-bottom:20px;white-space:pre-line}
-.hero-tag{font-size:15px;color:var(--fg2);margin-bottom:36px}
+/* hero */
+.hero{padding:96px 0 72px}
+.hero h1{font-size:clamp(44px,6vw,72px);font-weight:700;letter-spacing:-.04em;line-height:1.05;margin-bottom:22px;white-space:pre-line}
+.hero-tag{font-size:16px;color:var(--fg2);margin-bottom:36px}
 .url-row{display:flex;max-width:640px}
-.examples{margin-top:12px;font-size:13px;color:var(--fg3)}
+.examples{margin-top:14px;font-size:13px;color:var(--fg3)}
 .eg{color:var(--fg2);cursor:pointer;text-decoration:underline;text-decoration-color:var(--border2);transition:color .15s}
 .eg:hover{color:var(--fg)}
+
+/* value props */
+.vp{padding:0 0 72px}
+.vp-desc{font-size:17px;color:var(--fg2);line-height:1.8;max-width:580px;margin-bottom:52px}
+.vp-stats{display:flex;gap:56px;flex-wrap:wrap}
+.vp-stat{display:flex;flex-direction:column;gap:6px}
+.vp-num{font-size:28px;font-weight:700;letter-spacing:-.04em;color:var(--fg)}
+.vp-lbl{font-size:13px;color:var(--fg3);line-height:1.4;max-width:140px}
+
 /* sections */
-.sec{padding:72px 0;border-top:1px solid var(--border)}
-.sec h2{font-size:26px;font-weight:600;letter-spacing:-.025em;margin-bottom:8px}
-.sec-sub{font-size:15px;color:var(--fg2);margin-bottom:40px;max-width:560px;line-height:1.75}
-/* agent block */
-.agent-block{background:var(--code-bg);padding:24px 28px;max-width:680px;position:relative;margin-bottom:16px}
-.agent-block pre{font-family:var(--mono);font-size:13px;line-height:1.85;color:var(--code-fg);white-space:pre;margin:0}
-.agent-copy{position:absolute;top:12px;right:12px}
+.sec{padding:64px 0}
+.sec h2{font-size:24px;font-weight:600;letter-spacing:-.025em;margin-bottom:10px}
+.sec-sub{font-size:16px;color:var(--fg2);margin-bottom:36px;max-width:560px;line-height:1.75}
+
+/* agent block — plain, readable */
+.agent-block{background:var(--bg2);padding:24px 28px;max-width:680px;position:relative}
+.agent-block pre{font-family:var(--mono);font-size:13px;line-height:1.9;color:var(--fg2);white-space:pre;margin:0}
+.agent-copy{position:absolute;top:12px;right:12px;background:none;border:none;font-family:var(--mono);font-size:11px;color:var(--fg3);cursor:pointer;padding:4px 8px;transition:color .15s}
+.agent-copy:hover{color:var(--fg)}
+
 /* how it works */
-.tier-list{display:flex;flex-direction:column;gap:0;max-width:680px;border:1px solid var(--border)}
-.tier-row{display:grid;grid-template-columns:180px 1fr;border-bottom:1px solid var(--border)}
-.tier-row:last-child{border-bottom:none}
-.tier-name{padding:16px 20px;font-family:var(--mono);font-size:12px;color:var(--fg3);border-right:1px solid var(--border);display:flex;align-items:center}
-.tier-desc{padding:16px 20px;font-size:14px;color:var(--fg2);line-height:1.65}
+.tier-list{display:flex;flex-direction:column;gap:28px;max-width:680px}
+.tier-row{display:grid;grid-template-columns:160px 1fr}
+.tier-name{font-family:var(--mono);font-size:11px;color:var(--fg3);padding-top:3px;letter-spacing:.05em;text-transform:uppercase}
+.tier-desc{font-size:16px;color:var(--fg2);line-height:1.65}
 .tier-desc strong{color:var(--fg);font-weight:500}
-.tier-note{margin-top:16px;font-size:13px;color:var(--fg3);max-width:680px}
-/* code tabs */
-.cbar{display:flex;background:var(--bg2);border:1px solid var(--border);border-bottom:none}
-.ctab{font-family:var(--mono);font-size:13px;padding:9px 16px;background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer;color:var(--fg3);transition:color .15s,border-color .15s}
-.ctab.on{color:var(--fg);border-bottom-color:var(--fg)}
-.cpanel{display:none;background:var(--code-bg);padding:22px;overflow-x:auto;position:relative;border:1px solid var(--border)}
-.cpanel.on{display:block}
-.cpanel pre{font-family:var(--mono);font-size:13px;line-height:1.7;color:var(--code-fg);white-space:pre;margin:0}
-.c1{color:#6b7280}.c2{color:#93c5fd}.c3{color:#86efac}.c4{color:#fcd34d}
-.copy-btn{position:absolute;top:12px;right:12px}
-/* api endpoints */
-.ep{border:1px solid var(--border);margin-bottom:16px}
-.eph{padding:12px 16px;display:flex;align-items:center;gap:10px;background:var(--bg2);border-bottom:1px solid var(--border)}
-.mtag{font-family:var(--mono);font-size:11px;font-weight:600;padding:3px 8px;flex-shrink:0}
-.get{background:#f0fdf4;color:#15803d}
-.post{background:#eff6ff;color:#1d4ed8}
-[data-theme="dark"] .get{background:#052e16;color:#86efac}
-[data-theme="dark"] .post{background:#0c1a3d;color:#93c5fd}
-.epath{font-family:var(--mono);font-size:13px}
-.edesc{font-size:12px;color:var(--fg3);margin-left:auto}
-.epcode{background:var(--code-bg);padding:22px;overflow-x:auto;position:relative}
-.epcode pre{font-family:var(--mono);font-size:12.5px;line-height:1.8;color:var(--code-fg);white-space:pre;margin:0}
-.rk{color:#93c5fd}.rv{color:#e4e4e7}.rc{color:#6b7280}
+.tier-note{margin-top:32px;font-size:14px;color:var(--fg3);max-width:680px;line-height:1.7}
+
+@media(max-width:600px){
+  .vp-stats{gap:32px}
+  .tier-row{grid-template-columns:1fr;gap:4px}
+  .tier-name{padding-top:0}
+}
   </style>
 </head>
 <body>
@@ -66,21 +61,18 @@
 <header>
   <div class="hdr">
     <a href="/" class="logo">
-      <span class="logo-sq">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--bg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="18" height="18" rx="2"/>
-          <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
-        </svg>
-      </span>
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="3" y="3" width="18" height="18" rx="2"/>
+        <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
+      </svg>
       markdown.go-mizu
     </a>
     <nav>
-      <a href="#api">API</a>
       <a href="/docs">Docs</a>
       <a href="https://github.com/go-mizu/mizu">GitHub</a>
       <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
-        <svg id="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
-        <svg id="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+        <svg id="icon-moon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
+        <svg id="icon-sun" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
       </button>
     </nav>
   </div>
@@ -104,23 +96,38 @@ Clean Markdown.</h1>
 </div>
 
 <div class="w">
+  <div class="vp">
+    <p class="vp-desc">The web was built for humans. AI agents need structured data. We convert any URL to clean Markdown using Cloudflare's native <code>text/markdown</code> content negotiation — no parsing overhead, no wasted tokens.</p>
+    <div class="vp-stats">
+      <div class="vp-stat">
+        <div class="vp-num">80%</div>
+        <div class="vp-lbl">fewer tokens than raw HTML</div>
+      </div>
+      <div class="vp-stat">
+        <div class="vp-num">0.1–0.6s</div>
+        <div class="vp-lbl">typical response, edge-cached globally</div>
+      </div>
+      <div class="vp-stat">
+        <div class="vp-num">Free</div>
+        <div class="vp-lbl">open access — just use the URL</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="w">
   <section class="sec" id="agents">
     <h2>For AI Agents</h2>
-    <p class="sec-sub">Copy these instructions into your agent's system prompt.</p>
+    <p class="sec-sub">Add this to your agent's system prompt:</p>
     <div class="agent-block">
       <button class="agent-copy" id="agent-copy-btn" onclick="copyAgentInstructions()">copy</button>
-      <pre id="agent-instructions">Use https://markdown.go-mizu.workers.dev to read any URL
-as clean Markdown. No auth required. Free.
+      <pre id="agent-instructions">Use https://markdown.go-mizu.workers.dev to read any URL as clean Markdown.
 
-Fetch any URL as Markdown text:
-  GET https://markdown.go-mizu.workers.dev/{url}
-  Returns: text/markdown
+GET  https://markdown.go-mizu.workers.dev/{url}
+POST https://markdown.go-mizu.workers.dev/convert
+     Body: {"url": "https://example.com"}
 
-Fetch with JSON metadata (method, duration, title):
-  POST https://markdown.go-mizu.workers.dev/convert
-  Content-Type: application/json
-  {"url": "https://example.com"}
-  Returns: {"markdown": "...", "method": "...", "durationMs": N, "title": "..."}</pre>
+No auth required. Returns text/markdown or JSON with metadata.</pre>
     </div>
   </section>
 </div>
@@ -132,130 +139,18 @@ Fetch with JSON metadata (method, duration, title):
     <div class="tier-list">
       <div class="tier-row">
         <div class="tier-name">Tier 1 · Native</div>
-        <div class="tier-desc"><strong>Accept: text/markdown</strong> negotiation — sites that natively serve Markdown return it directly.</div>
+        <div class="tier-desc"><strong>Content negotiation</strong> — sites that natively serve <code>text/markdown</code> return it directly, with zero processing.</div>
       </div>
       <div class="tier-row">
-        <div class="tier-name">Tier 2 · Workers AI</div>
-        <div class="tier-desc">HTML fetched and converted via <strong>Cloudflare Workers AI</strong> toMarkdown() — fast, structure-aware extraction.</div>
+        <div class="tier-name">Tier 2 · AI</div>
+        <div class="tier-desc">HTML fetched and converted via <strong>Cloudflare Workers AI</strong> — fast, structure-aware HTML-to-Markdown extraction.</div>
       </div>
       <div class="tier-row">
         <div class="tier-name">Tier 3 · Browser</div>
-        <div class="tier-desc">JS-heavy SPAs rendered in a <strong>headless browser</strong> via Puppeteer before AI conversion.</div>
+        <div class="tier-desc">JS-heavy SPAs rendered in a <strong>headless browser</strong> before AI conversion — handles React, Vue, any SPA.</div>
       </div>
     </div>
-    <p class="tier-note">Responses are edge-cached for 1 hour with stale-while-revalidate. CORS enabled — fetch from any origin.</p>
-  </section>
-</div>
-
-<div class="w">
-  <section class="sec" id="code">
-    <h2>Code examples</h2>
-    <p class="sec-sub">Works with any HTTP client.</p>
-    <div class="cbar">
-      <button class="ctab on" id="ctab-sh" onclick="switchCode('sh')">Shell</button>
-      <button class="ctab" id="ctab-js" onclick="switchCode('js')">JavaScript</button>
-      <button class="ctab" id="ctab-py" onclick="switchCode('py')">Python</button>
-      <button class="ctab" id="ctab-ts" onclick="switchCode('ts')">TypeScript</button>
-    </div>
-    <div id="cpanel-sh" class="cpanel on">
-      <button class="copy-btn" onclick="copyBlock('cpanel-sh',this)">copy</button>
-      <pre><span class="c1"># Returns text/markdown</span>
-curl https://markdown.go-mizu.workers.dev/https://example.com
-
-<span class="c1"># Returns structured JSON</span>
-curl -s -X POST https://markdown.go-mizu.workers.dev/convert \
-  -H <span class="c3">'Content-Type: application/json'</span> \
-  -d <span class="c3">'{"url":"https://example.com"}'</span></pre>
-    </div>
-    <div id="cpanel-js" class="cpanel">
-      <button class="copy-btn" onclick="copyBlock('cpanel-js',this)">copy</button>
-      <pre><span class="c1">// Markdown text</span>
-<span class="c2">const</span> md = <span class="c2">await</span> <span class="c4">fetch</span>(
-  <span class="c3">'https://markdown.go-mizu.workers.dev/'</span> + url
-).<span class="c4">then</span>(r =&gt; r.<span class="c4">text</span>());
-
-<span class="c1">// JSON with metadata</span>
-<span class="c2">const</span> res = <span class="c2">await</span> <span class="c4">fetch</span>(<span class="c3">'https://markdown.go-mizu.workers.dev/convert'</span>, {
-  method: <span class="c3">'POST'</span>,
-  headers: { <span class="c3">'Content-Type'</span>: <span class="c3">'application/json'</span> },
-  body: JSON.<span class="c4">stringify</span>({ url })
-}).<span class="c4">then</span>(r =&gt; r.<span class="c4">json</span>());</pre>
-    </div>
-    <div id="cpanel-py" class="cpanel">
-      <button class="copy-btn" onclick="copyBlock('cpanel-py',this)">copy</button>
-      <pre><span class="c2">import</span> httpx
-
-<span class="c1"># Markdown text</span>
-md = httpx.<span class="c4">get</span>(<span class="c3">'https://markdown.go-mizu.workers.dev/'</span> + url).text
-
-<span class="c1"># JSON with metadata</span>
-res = httpx.<span class="c4">post</span>(
-    <span class="c3">'https://markdown.go-mizu.workers.dev/convert'</span>,
-    json={<span class="c3">'url'</span>: url}
-).<span class="c4">json</span>()</pre>
-    </div>
-    <div id="cpanel-ts" class="cpanel">
-      <button class="copy-btn" onclick="copyBlock('cpanel-ts',this)">copy</button>
-      <pre><span class="c2">const</span> md = <span class="c2">await</span> <span class="c4">fetch</span>(
-  <span class="c3">'https://markdown.go-mizu.workers.dev/'</span> + url
-).<span class="c4">then</span>(r =&gt; r.<span class="c4">text</span>());
-
-<span class="c2">interface</span> ConvertResult {
-  markdown: <span class="c3">string</span>;
-  method: <span class="c3">'primary'</span> | <span class="c3">'ai'</span> | <span class="c3">'browser'</span>;
-  durationMs: <span class="c3">number</span>;
-  title: <span class="c3">string</span>;
-  tokens?: <span class="c3">number</span>;
-}
-<span class="c2">const</span> res = <span class="c2">await</span> <span class="c4">fetch</span>(<span class="c3">'https://markdown.go-mizu.workers.dev/convert'</span>, {
-  method: <span class="c3">'POST'</span>,
-  headers: { <span class="c3">'Content-Type'</span>: <span class="c3">'application/json'</span> },
-  body: JSON.<span class="c4">stringify</span>({ url })
-}).<span class="c4">then</span>(r =&gt; r.<span class="c4">json</span>() <span class="c2">as</span> Promise&lt;ConvertResult&gt;);</pre>
-    </div>
-  </section>
-</div>
-
-<div class="w">
-  <section class="sec" id="api">
-    <h2>API reference</h2>
-
-    <div class="ep">
-      <div class="eph">
-        <span class="mtag get">GET</span>
-        <span class="epath">/{url}</span>
-        <span class="edesc">Returns text/markdown</span>
-      </div>
-      <div class="epcode" id="ep-get">
-        <button class="copy-btn" onclick="copyBlock('ep-get',this)">copy</button>
-        <pre><span class="rc"># Append any absolute URL (http:// or https://)</span>
-curl https://markdown.go-mizu.workers.dev/https://example.com</pre>
-      </div>
-    </div>
-
-    <div class="ep">
-      <div class="eph">
-        <span class="mtag post">POST</span>
-        <span class="epath">/convert</span>
-        <span class="edesc">Returns JSON</span>
-      </div>
-      <div class="epcode" id="ep-post">
-        <button class="copy-btn" onclick="copyBlock('ep-post',this)">copy</button>
-        <pre><span class="rc"># Request</span>
-curl -X POST https://markdown.go-mizu.workers.dev/convert \
-  -H <span class="rv">'Content-Type: application/json'</span> \
-  -d <span class="rv">'{"url":"https://example.com"}'</span>
-
-<span class="rc"># Response</span>
-{
-  <span class="rk">"markdown"</span>: <span class="rv">"# Example Domain\n\n..."</span>,
-  <span class="rk">"method"</span>: <span class="rv">"ai"</span>,
-  <span class="rk">"durationMs"</span>: <span class="rv">342</span>,
-  <span class="rk">"title"</span>: <span class="rv">"Example Domain"</span>,
-  <span class="rk">"tokens"</span>: <span class="rv">1248</span>
-}</pre>
-      </div>
-    </div>
+    <p class="tier-note">Responses are edge-cached for 1 hour with stale-while-revalidate. CORS enabled on all endpoints.</p>
   </section>
 </div>
 
@@ -305,31 +200,6 @@ function fallbackCopy(text) {
   ta.select();
   document.execCommand('copy');
   document.body.removeChild(ta);
-}
-
-function switchCode(lang) {
-  ['sh','js','py','ts'].forEach(function(k) {
-    document.getElementById('cpanel-'+k).className = 'cpanel'+(k===lang?' on':'');
-    document.getElementById('ctab-'+k).className = 'ctab'+(k===lang?' on':'');
-  });
-}
-
-function copyBlock(panelId, btn) {
-  var el = document.getElementById(panelId);
-  if (!el) return;
-  var target = el.querySelector('pre') || el;
-  var text = target.innerText || target.textContent || '';
-  var origText = btn.textContent;
-  function done() {
-    btn.textContent = 'copied!';
-    setTimeout(function() { btn.textContent = origText; }, 2000);
-  }
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(done).catch(function() { fallbackCopy(text); done(); });
-  } else {
-    fallbackCopy(text);
-    done();
-  }
 }
 
 function updateToggleIcon() {
