@@ -1040,6 +1040,9 @@ func runHNRecrawlV3(ctx context.Context,
 		mode = "batch"
 	}
 
+	benchDataDir := hnCfg.WithDefaults().RecrawlDir()
+	bt := crawl.NewBenchTracker(mode)
+
 	var stats *crawl.Stats
 	var runErr error
 
@@ -1073,11 +1076,13 @@ func runHNRecrawlV3(ctx context.Context,
 			fmt.Printf("  Batch %d/%d: %d domains, %d seeds\n",
 				batchNum, totalBatches, end-start, len(batchSeeds))
 
+			batchStart := time.Now()
 			var batchStats *crawl.Stats
 			if batchStats, runErr = eng.Run(ctx, batchSeeds, dnsCache, cfg, pw, fw); runErr != nil && ctx.Err() == nil {
 				break
 			}
 			if batchStats != nil {
+				bt.RecordBatch(batchStats.OK, time.Since(batchStart))
 				if stats == nil {
 					stats = batchStats
 				} else {
@@ -1109,7 +1114,11 @@ func runHNRecrawlV3(ctx context.Context,
 			cfg.Workers = crawl.AutoWorkersFull(int(si.MemAvailableMB), 256)
 		}
 		fmt.Printf("  Chunk mode:    stream (workers=%d)\n", cfg.Workers)
+		streamStart := time.Now()
 		stats, runErr = eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
+		if stats != nil {
+			bt.RecordBatch(stats.OK, time.Since(streamStart))
+		}
 
 	case "pipeline":
 		si2 := crawl.LoadOrGatherSysInfo("", 0)
@@ -1118,6 +1127,7 @@ func runHNRecrawlV3(ctx context.Context,
 			batchDomains = crawl.AutoBatchDomains(int(si2.MemAvailableMB), 3, 256)
 		}
 		fmt.Printf("  Chunk mode:    pipeline (%d domains/batch)\n", batchDomains)
+		pipeStart := time.Now()
 		var pipeStats *crawl.Stats
 		pipeStats, runErr = crawl.RunPipeline(ctx, crawl.PipelineConfig{
 			Cfg:       cfg,
@@ -1130,10 +1140,18 @@ func runHNRecrawlV3(ctx context.Context,
 			AvailMB:   int(si2.MemAvailableMB),
 		})
 		stats = pipeStats
+		if stats != nil {
+			bt.RecordBatch(stats.OK, time.Since(pipeStart))
+		}
 
 	default:
 		fmt.Printf("  Chunk mode:    %s (fallback to stream)\n", mode)
 		stats, runErr = eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
+	}
+
+	// Save benchmark result for this mode.
+	if saveErr := bt.Save(benchDataDir); saveErr != nil {
+		fmt.Fprintf(os.Stderr, "  [warn] bench save: %v\n", saveErr)
 	}
 	cancelProgress()
 	<-progressDone
