@@ -3,6 +3,8 @@ package cli
 import (
 	"context"
 	"fmt"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -13,9 +15,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/go-mizu/mizu/blueprints/search/pkg/hn"
 	"github.com/go-mizu/mizu/blueprints/search/pkg/archived/recrawler"
 	crawl "github.com/go-mizu/mizu/blueprints/search/pkg/crawl"
+	"github.com/go-mizu/mizu/blueprints/search/pkg/crawl/bodystore"
+	"github.com/go-mizu/mizu/blueprints/search/pkg/hn"
 	"github.com/spf13/cobra"
 )
 
@@ -557,6 +560,10 @@ func newHNRecrawl() *cobra.Command {
 		retryTimeoutMs      int
 		noRetry             bool
 		writerMode          string
+		chunkMode           string
+		chunkSize           int
+		pprofPort           int
+		bodyStoreDir        string
 	)
 	cmd := &cobra.Command{
 		Use:   "recrawl",
@@ -571,6 +578,10 @@ and adaptive timeouts.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx, stop := hnSignalContext(cmd.Context())
 			defer stop()
+			if pprofPort > 0 {
+				go func() { _ = http.ListenAndServe(fmt.Sprintf(":%d", pprofPort), nil) }()
+				fmt.Printf("  pprof:         http://localhost:%d/debug/pprof/\n", pprofPort)
+			}
 			cfg := hnConfigFromCmd(cmd)
 			if strings.TrimSpace(domainsDB) == "" {
 				domainsDB = cfg.WithDefaults().DomainsDBPath()
@@ -662,7 +673,8 @@ and adaptive timeouts.`,
 			return runHNRecrawlV3(ctx, cfg, seedRes,
 				engine, workers, maxConnsPerDomain, timeoutMs, domainFailThreshold, domainTimeoutMs, statusOnly, batchSize, int64(slowDomainMs),
 				dnsWorkers, dnsTimeoutMs,
-				retryTimeoutMs, noRetry, writerMode)
+				retryTimeoutMs, noRetry, writerMode,
+				chunkMode, chunkSize, bodyStoreDir)
 		},
 	}
 	cmd.Flags().StringVar(&domainsDB, "domains-db", "", "Path to hn_domains DuckDB (default: $HOME/data/hn/hn_domains.duckdb)")
@@ -688,6 +700,10 @@ and adaptive timeouts.`,
 	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 5000, "Pass-2 timeout for retrying http_timeout URLs (ms); 0=disabled")
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs (faster; may miss slow-but-live servers)")
 	cmd.Flags().StringVar(&writerMode, "writer", "duckdb", "Result writer backend: duckdb (default), bin (non-blocking NDJSON→DuckDB drain), devnull (benchmark only)")
+	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "batch", "Chunk mode: stream|batch|pipeline")
+	cmd.Flags().IntVar(&chunkSize, "chunk-size", 0, "Override batch domain count (0=auto)")
+	cmd.Flags().IntVar(&pprofPort, "pprof-port", 0, "Enable pprof HTTP server on this port (0=off)")
+	cmd.Flags().StringVar(&bodyStoreDir, "body-store", "", "Body CAS store dir (default: $dataDir/bodies)")
 	return cmd
 }
 
@@ -707,6 +723,9 @@ func runHNRecrawlV3(ctx context.Context,
 	retryTimeoutMs int,
 	noRetry bool,
 	writerMode string,
+	chunkMode string,
+	chunkSize int,
+	bodyStoreDir string,
 ) error {
 
 	eng, err := crawl.New(engineName)
@@ -972,6 +991,18 @@ func runHNRecrawlV3(ctx context.Context,
 		progressInterval = 2 * time.Second
 	}
 
+	// Open body store
+	bsDir := bodyStoreDir
+	if bsDir == "" {
+		bsDir = filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "bodies")
+	}
+	bs, bsErr := bodystore.Open(bsDir)
+	if bsErr != nil {
+		return fmt.Errorf("open body store: %w", bsErr)
+	}
+	fmt.Printf("  Body store:    %s\n", labelStyle.Render(bsDir))
+	cfg.BodyStore = bs
+
 	progressCtx, cancelProgress := context.WithCancel(ctx)
 	defer cancelProgress()
 	progressDone := make(chan struct{})
@@ -1003,7 +1034,87 @@ func runHNRecrawlV3(ctx context.Context,
 		}
 	}()
 
-	stats, runErr := eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
+	// Run engine with chunk-mode switch.
+	mode := chunkMode
+	if mode == "" {
+		mode = "batch"
+	}
+
+	var stats *crawl.Stats
+	var runErr error
+
+	switch mode {
+	case "batch":
+		si := crawl.LoadOrGatherSysInfo("", 0)
+		batchDomains := chunkSize
+		if batchDomains <= 0 {
+			batchDomains = crawl.AutoBatchDomains(int(si.MemAvailableMB), 3, 256)
+		}
+		fmt.Printf("  Chunk mode:    batch (%d domains/batch)\n", batchDomains)
+
+		// Group seeds by domain.
+		domainMap := make(map[string][]recrawler.SeedURL)
+		for _, s := range seeds {
+			domainMap[s.Domain] = append(domainMap[s.Domain], s)
+		}
+		domainKeys := make([]string, 0, len(domainMap))
+		for d := range domainMap {
+			domainKeys = append(domainKeys, d)
+		}
+
+		totalBatches := (len(domainKeys) + batchDomains - 1) / batchDomains
+		for start := 0; start < len(domainKeys); start += batchDomains {
+			end := min(start+batchDomains, len(domainKeys))
+			var batchSeeds []recrawler.SeedURL
+			for _, d := range domainKeys[start:end] {
+				batchSeeds = append(batchSeeds, domainMap[d]...)
+			}
+			batchNum := start/batchDomains + 1
+			fmt.Printf("  Batch %d/%d: %d domains, %d seeds\n",
+				batchNum, totalBatches, end-start, len(batchSeeds))
+
+			var batchStats *crawl.Stats
+			if batchStats, runErr = eng.Run(ctx, batchSeeds, dnsCache, cfg, pw, fw); runErr != nil && ctx.Err() == nil {
+				break
+			}
+			if batchStats != nil {
+				if stats == nil {
+					stats = batchStats
+				} else {
+					stats.OK += batchStats.OK
+					stats.Total += batchStats.Total
+					stats.Failed += batchStats.Failed
+					stats.Bytes += batchStats.Bytes
+					if batchStats.PeakRPS > stats.PeakRPS {
+						stats.PeakRPS = batchStats.PeakRPS
+					}
+				}
+			}
+			if ctx.Err() != nil {
+				break
+			}
+			// Release ~2 GB DuckDB CGO pool between batches.
+			if rdb != nil {
+				if reopenErr := rdb.ReopenShards(); reopenErr != nil {
+					fmt.Fprintf(os.Stderr, "  [warn] ReopenShards: %v\n", reopenErr)
+				}
+			}
+			debug.FreeOSMemory()
+		}
+
+	case "stream":
+		si := crawl.LoadOrGatherSysInfo("", 0)
+		// Only auto-tune if --workers was not explicitly set.
+		if workers <= 0 {
+			cfg.Workers = crawl.AutoWorkersFull(int(si.MemAvailableMB), 256)
+		}
+		fmt.Printf("  Chunk mode:    stream (workers=%d)\n", cfg.Workers)
+		stats, runErr = eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
+
+	default:
+		fmt.Printf("  Chunk mode:    %s (fallback to stream)\n", mode)
+		stats, runErr = eng.Run(ctx, seeds, dnsCache, cfg, pw, fw)
+	}
 	cancelProgress()
 	<-progressDone
 
@@ -1012,6 +1123,9 @@ func runHNRecrawlV3(ctx context.Context,
 	}
 	if runErr != nil {
 		return fmt.Errorf("engine run: %w", runErr)
+	}
+	if stats == nil {
+		stats = &crawl.Stats{}
 	}
 
 	skipped := ls.skipped.Load()
