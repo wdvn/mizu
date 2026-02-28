@@ -439,8 +439,14 @@ func LoadTimeoutURLs(dbPath string) ([]SeedURL, error) {
 }
 
 // LoadRetryURLs reads all URLs worth retrying in pass 2:
-//   - http_timeout: server connected but timed out (most common false negative)
-//   - dns_timeout:  DNS lookup timed out; may succeed with more time
+//   - http_timeout:                server connected but timed out
+//   - dns_timeout:                 DNS lookup timed out
+//   - domain_http_timeout_killed:  domain hit DomainFailThreshold; URL never ran
+//   - domain_deadline_exceeded:    domain 30s deadline fired; URL never ran
+//
+// The last two are critical: URLs that were never attempted because their domain
+// was abandoned must be retried with DomainFailThreshold=0 in pass 2 so every
+// URL gets a fair chance at the longer timeout.
 //
 // Returns seeds ordered by domain for connection-pool efficiency.
 func LoadRetryURLs(dbPath string) ([]SeedURL, error) {
@@ -453,7 +459,12 @@ func LoadRetryURLs(dbPath string) ([]SeedURL, error) {
 	rows, err := db.Query(`
 		SELECT url, domain
 		FROM failed_urls
-		WHERE reason IN ('http_timeout', 'dns_timeout')
+		WHERE reason IN (
+			'http_timeout',
+			'dns_timeout',
+			'domain_http_timeout_killed',
+			'domain_deadline_exceeded'
+		)
 		ORDER BY domain, url
 	`)
 	if err != nil {

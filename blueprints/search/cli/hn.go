@@ -1224,8 +1224,10 @@ func runHNRecrawlV3(ctx context.Context,
 			retryCfg.Timeout = time.Duration(retryTimeoutMs) * time.Millisecond
 			// Half the workers for pass 2 — slow domains need more time but we still want throughput.
 			retryCfg.Workers = max(workers/2, 200)
-			// Be more lenient: don't abandon domains early in pass 2 (they might just be slow).
-			retryCfg.DomainFailThreshold = 1
+			// Disable domain-kill in pass 2: every URL must get a fair attempt at the longer
+			// timeout. domain_http_timeout_killed URLs from pass 1 are now retried here, and we
+			// must not kill them again before they have a chance to respond.
+			retryCfg.DomainFailThreshold = 0
 			// Longer domain deadline for pass 2 (slow servers need time).
 			retryCfg.DomainTimeout = time.Duration(retryTimeoutMs*3) * time.Millisecond
 
