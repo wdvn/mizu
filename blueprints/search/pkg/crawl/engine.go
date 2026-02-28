@@ -29,6 +29,7 @@ type Stats struct {
 	Duration time.Duration
 	P95LatMs int64
 	MemRSS   int64 // bytes at end of run
+	Workers  int   // resolved worker count after auto-config
 }
 
 // Config configures any engine.
