@@ -955,7 +955,7 @@ func runHNRecrawlV3(ctx context.Context,
 	case "bin":
 		segDir := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "segments")
 		var bwErr error
-		binWriter, bwErr = crawl.NewBinSegWriter(segDir, 0, rdb)
+		binWriter, bwErr = crawl.NewBinSegWriter(segDir, 0, int(si.MemAvailableMB), rdb)
 		if bwErr != nil {
 			return fmt.Errorf("creating bin writer: %w", bwErr)
 		}

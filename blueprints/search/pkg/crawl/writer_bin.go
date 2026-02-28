@@ -1,12 +1,15 @@
 package crawl
 
 import (
-	"bufio"
 	"context"
 	"encoding/gob"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,12 +17,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/go-mizu/mizu/blueprints/search/pkg/archived/recrawler"
+	"github.com/go-mizu/mizu/blueprints/search/pkg/crawl/bseg"
 )
 
 const (
-	// binChanCap is the number of Result records buffered in the write channel.
+	// binChanCap is the fallback channel capacity when availMB=0.
 	// At 10K writes/s this provides ~3.2 seconds of headroom before any worker blocks.
-	// Reduced from 128K to 32K: worst-case channel memory = 32K × avg_record ≈ 256 MB.
 	binChanCap = 32768 // 32K records
 
 	// binSegQueueCap is the number of completed segment paths buffered for the drain goroutine.
@@ -32,55 +35,27 @@ const (
 	binFlushBufSize = 512 * 1024 // 512 KB
 )
 
-// binRecord is the gob serialization type for binary segments (.bseg files).
-//
-// gob encodes field names once (in the type descriptor on first Encode call),
-// then uses field indices for all subsequent records — zero per-record field-name overhead.
-// Failed replaces the string "status" field: false=done, true=failed.
-type binRecord struct {
-	URL           string
-	StatusCode    int
-	ContentType   string
-	ContentLength int64
-	BodyCID       string // CAS reference; "" = body not stored
-	Title         string
-	Description   string
-	Language      string
-	Domain        string
-	RedirectURL   string
-	FetchTimeMs   int64
-	CrawledAtMs   int64 // Unix milliseconds
-	Error         string
-	Failed        bool // false=done, true=failed
-}
-
-func (r *binRecord) toResult() recrawler.Result {
-	return recrawler.Result{
-		URL:           r.URL,
-		StatusCode:    r.StatusCode,
-		ContentType:   r.ContentType,
-		ContentLength: r.ContentLength,
-		BodyCID:       r.BodyCID,
-		Title:         r.Title,
-		Description:   r.Description,
-		Language:      r.Language,
-		Domain:        r.Domain,
-		RedirectURL:   r.RedirectURL,
-		FetchTimeMs:   r.FetchTimeMs,
-		CrawledAt:     time.UnixMilli(r.CrawledAtMs),
-		Error:         r.Error,
+// binChanCapFromMem computes the result channel capacity.
+// Targets 5% of available RAM for the write buffer.
+// avgRecordKB: estimated bytes per Result record (default 8).
+func binChanCapFromMem(availMB, avgRecordKB int) int {
+	if availMB <= 0 || avgRecordKB <= 0 {
+		return binChanCap // default
 	}
+	v := availMB * 1024 / 20 / avgRecordKB
+	return clamp(v, 4096, 65536)
 }
 
-// BinSegWriter writes results to rotating binary segment files (.bseg).
+// BinSegWriter writes results to rotating binary segment files (.bseg2).
 //
-// Write path: HTTP workers → ch (32K buffer) → flusher goroutine → gob-encoded file write.
+// Write path: HTTP workers → ch (RAM-proportional buffer) → flusher goroutine → bseg-encoded file write.
 // Drain path: completed segments → drain goroutine → rdb.Add() → DuckDB (background).
 //
 // Key design properties:
-//   - Zero per-record heap alloc: gob.Encoder writes directly to bufio.Writer; binRecord reused.
-//   - After segment close: curBuf=nil, curEnc=nil — buffers are GC-eligible immediately.
-//   - Channel memory bounded: 32K cap × ~8KB avg record = ~256 MB worst case.
+//   - Zero per-record heap alloc: bseg.Encoder writes directly to bufio.Writer; bseg.Record reused.
+//   - After segment close: curEnc=nil — buffers are GC-eligible immediately.
+//   - Channel memory bounded: cap × ~8KB avg record.
+//   - Legacy .bseg (gob) files supported via drainSegGob fallback.
 //
 // BinSegWriter implements crawl.ResultWriter.
 type BinSegWriter struct {
@@ -93,12 +68,11 @@ type BinSegWriter struct {
 
 	// flusher state — accessed only by the flusher goroutine, no lock needed.
 	cur      *os.File
-	curBuf   *bufio.Writer
-	curEnc   *gob.Encoder // one encoder per segment; nil when no segment is open
+	curEnc   *bseg.Encoder // one encoder per segment; nil when no segment is open
 	curBytes int64
 	curPath  string
 	segNum   int
-	jr       binRecord // reused record buffer; avoids a binRecord allocation per writeOne call
+	jr       bseg.Record // reused record buffer; avoids a bseg.Record allocation per writeOne call
 
 	written  atomic.Int64 // records written to segment files
 	drained  atomic.Int64 // records successfully drained to DuckDB
@@ -111,19 +85,21 @@ type BinSegWriter struct {
 // NewBinSegWriter creates a BinSegWriter that writes to segDir.
 //
 //   - maxMB: segment size threshold (0 → default 64 MB).
+//   - availMB: available RAM in MB for channel capacity tuning (0 → use default 32768).
 //   - rdb: the ResultDB to drain completed segments into (nil = accumulate on disk).
-func NewBinSegWriter(segDir string, maxMB int, rdb *recrawler.ResultDB) (*BinSegWriter, error) {
+func NewBinSegWriter(segDir string, maxMB int, availMB int, rdb *recrawler.ResultDB) (*BinSegWriter, error) {
 	if err := os.MkdirAll(segDir, 0o755); err != nil {
 		return nil, fmt.Errorf("bin writer: creating segment dir: %w", err)
 	}
 	if maxMB <= 0 {
 		maxMB = binSegDefaultMB
 	}
+	chanCap := binChanCapFromMem(availMB, 8)
 	w := &BinSegWriter{
 		segDir:   segDir,
 		maxBytes: int64(maxMB) * 1024 * 1024,
 		rdb:      rdb,
-		ch:       make(chan recrawler.Result, binChanCap),
+		ch:       make(chan recrawler.Result, chanCap),
 		segCh:    make(chan string, binSegQueueCap),
 	}
 	w.wg.Add(2) // flusher + drainer
@@ -132,7 +108,7 @@ func NewBinSegWriter(segDir string, maxMB int, rdb *recrawler.ResultDB) (*BinSeg
 	return w, nil
 }
 
-// Add enqueues a result for writing. It blocks only when the 32K channel is full
+// Add enqueues a result for writing. It blocks only when the channel is full
 // (which only occurs if the flusher goroutine cannot keep up with disk writes).
 // Under normal operation this channel stays near-empty.
 func (w *BinSegWriter) Add(r recrawler.Result) {
@@ -173,9 +149,18 @@ func (w *BinSegWriter) ChanFill() float64 {
 	return float64(len(w.ch)) / float64(c)
 }
 
+// shouldPause returns true when heap usage exceeds 70% of GOMEMLIMIT and the
+// write channel is more than 90% full. Used by the flusher to apply back-pressure.
+func (w *BinSegWriter) shouldPause() bool {
+	var ms runtime.MemStats
+	runtime.ReadMemStats(&ms)
+	limit := uint64(debug.SetMemoryLimit(-1))
+	return limit > 0 && ms.HeapAlloc > limit*7/10 && w.ChanFill() > 0.9
+}
+
 // ── flusher ──────────────────────────────────────────────────────────────────
 
-// flusher drains w.ch, encodes each Result as a gob record, and writes to
+// flusher drains w.ch, encodes each Result as a bseg record, and writes to
 // the current segment file. When the segment reaches maxBytes, it's closed and
 // its path sent to segCh for the drain goroutine.
 func (w *BinSegWriter) flusher() {
@@ -185,6 +170,9 @@ func (w *BinSegWriter) flusher() {
 		w.wg.Done()
 	}()
 	for r := range w.ch {
+		if w.shouldPause() {
+			time.Sleep(100 * time.Millisecond)
+		}
 		w.writeOne(r)
 	}
 }
@@ -198,54 +186,64 @@ func (w *BinSegWriter) writeOne(r recrawler.Result) {
 		}
 	}
 
-	// Reuse w.jr to avoid a binRecord allocation per record.
+	// Reuse w.jr to avoid a bseg.Record allocation per record.
 	jr := &w.jr
-	jr.URL           = binSanitize(r.URL)
-	jr.StatusCode    = r.StatusCode
-	jr.ContentType   = binSanitize(r.ContentType)
-	jr.ContentLength = r.ContentLength
-	jr.BodyCID       = r.BodyCID
-	jr.Title         = binSanitize(r.Title)
-	jr.Description   = binSanitize(r.Description)
-	jr.Language      = binSanitize(r.Language)
-	jr.Domain        = binSanitize(r.Domain)
-	jr.RedirectURL   = binSanitize(r.RedirectURL)
-	jr.FetchTimeMs   = r.FetchTimeMs
-	jr.CrawledAtMs   = r.CrawledAt.UnixMilli()
-	jr.Error         = binSanitize(r.Error)
-	jr.Failed        = r.Error != ""
+	jr.URL         = binSanitize(r.URL)
+	jr.StatusCode  = int32(r.StatusCode)
+	jr.ContentLen  = r.ContentLength
+	jr.BodyCID     = r.BodyCID
+	jr.Title       = binSanitize(r.Title)
+	jr.Description = binSanitize(r.Description)
+	jr.Language    = binSanitize(r.Language)
+	jr.Domain      = binSanitize(r.Domain)
+	jr.RedirectURL = binSanitize(r.RedirectURL)
+	jr.FetchMs     = r.FetchTimeMs
+	jr.CrawledMs   = r.CrawledAt.UnixMilli()
+	jr.Error       = binSanitize(r.Error)
+	jr.ContentType = binSanitize(r.ContentType)
+	jr.Failed      = r.Error != ""
 
-	// Track bytes written to the bufio buffer for segment rotation.
-	// b0/b1 are bytes currently in the buffer before/after Encode.
-	// If b1 < b0, bufio auto-flushed during Encode; adjust accordingly.
-	b0 := w.curBuf.Buffered()
 	if err := w.curEnc.Encode(jr); err != nil {
 		return
 	}
-	b1 := w.curBuf.Buffered()
-	if b1 >= b0 {
-		w.curBytes += int64(b1 - b0)
-	} else {
-		// bufio flushed between b0 and b1; full flush of b0 bytes + new b1 bytes
-		w.curBytes += int64(w.curBuf.Size()-b0) + int64(b1)
-	}
+	w.curBytes += recEstimatedSize(jr)
 	w.written.Add(1)
+}
+
+// recEstimatedSize returns the estimated encoded byte size for a bseg record.
+// This is exact for the bseg format:
+//
+//	4 (rec_len) + 1 (flags) + 4 (status) + 8 (content_len) + 8 (fetch_ms) + 8 (crawled_ms)
+//	+ 9 string fields × 2 (uint16 length prefix) + sum of string byte lengths
+func recEstimatedSize(r *bseg.Record) int64 {
+	const fixed = 4 + 1 + 4 + 8 + 8 + 8 // rec_len + flags + status + content_len + fetch_ms + crawled_ms
+	const strOverhead = 9 * 2             // 9 string fields × 2 bytes each for uint16 length
+	return int64(fixed + strOverhead +
+		len(r.URL) + len(r.ContentType) + len(r.BodyCID) + len(r.Title) +
+		len(r.Description) + len(r.Language) + len(r.Domain) + len(r.RedirectURL) + len(r.Error))
 }
 
 // rotateSeg closes the current segment (if any) and opens a new one.
 func (w *BinSegWriter) rotateSeg() {
 	w.closeCurrentSeg()
 	w.segNum++
-	path := filepath.Join(w.segDir, fmt.Sprintf("seg_%06d.bseg", w.segNum))
+	path := filepath.Join(w.segDir, fmt.Sprintf("seg_%06d.bseg2", w.segNum))
 	f, err := os.Create(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[binwriter] failed to create segment %s: %v\n", path, err)
 		w.cur = nil
 		return
 	}
+	enc, err := bseg.NewEncoder(f, binFlushBufSize)
+	if err != nil {
+		f.Close()
+		os.Remove(path)
+		fmt.Fprintf(os.Stderr, "[binwriter] failed to init encoder %s: %v\n", path, err)
+		w.cur = nil
+		return
+	}
 	w.cur = f
-	w.curBuf = bufio.NewWriterSize(f, binFlushBufSize)
-	w.curEnc = gob.NewEncoder(w.curBuf) // encoder writes directly to bufio, no intermediate alloc
+	w.curEnc = enc
 	w.curBytes = 0
 	w.curPath = path
 	w.segCount.Add(1)
@@ -257,14 +255,13 @@ func (w *BinSegWriter) closeCurrentSeg() {
 	if w.cur == nil {
 		return
 	}
-	w.curBuf.Flush()
-	w.cur.Close()
 	path := w.curPath
+	curBytes := w.curBytes
+	w.curEnc.Close() // flushes bufio + patches rec_count + closes file
 	w.cur = nil
-	w.curBuf = nil
-	w.curEnc = nil // release gob encoder's internal buffer (GC-eligible immediately)
+	w.curEnc = nil // release encoder's internal buffer (GC-eligible immediately)
 
-	if w.curBytes > 0 {
+	if curBytes > 0 {
 		w.pendSeg.Add(1)
 		w.segCh <- path // may block if drain is 16+ segments behind (expected: never)
 	}
@@ -292,8 +289,8 @@ func (w *BinSegWriter) drainer() {
 	}
 }
 
-// drainSeg reads a binary segment file (.bseg), calls rdb.Add for each record, then
-// deletes the file. Returns the number of records successfully decoded.
+// drainSeg reads a binary segment file (.bseg2 or legacy .bseg), calls rdb.Add
+// for each record, then deletes the file. Returns the number of records successfully decoded.
 func (w *BinSegWriter) drainSeg(path string) int64 {
 	defer os.Remove(path) // always delete — even on partial read
 
@@ -308,6 +305,36 @@ func (w *BinSegWriter) drainSeg(path string) int64 {
 	}
 	defer f.Close()
 
+	dec, err := bseg.NewDecoder(f)
+	if err != nil {
+		if errors.Is(err, bseg.ErrBadMagic) || errors.Is(err, bseg.ErrBadVersion) {
+			// Fallback: try legacy gob format (old .bseg files).
+			return w.drainSegGob(path, f)
+		}
+		fmt.Fprintf(os.Stderr, "[binwriter] drain header %s: %v\n", path, err)
+		return 0
+	}
+
+	var rec bseg.Record
+	var count int64
+	for {
+		if err := dec.Decode(&rec); err != nil {
+			break // EOF or corrupt
+		}
+		w.rdb.Add(bsegToResult(&rec))
+		count++
+	}
+	return count
+}
+
+// drainSegGob reads a legacy gob-encoded .bseg segment file. f must be seekable.
+// It seeks back to offset 0 before decoding.
+func (w *BinSegWriter) drainSegGob(path string, f *os.File) int64 {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		fmt.Fprintf(os.Stderr, "[binwriter] drain gob seek %s: %v\n", path, err)
+		return 0
+	}
+
 	dec := gob.NewDecoder(f)
 	var rec binRecord
 	var count int64
@@ -319,6 +346,64 @@ func (w *BinSegWriter) drainSeg(path string) int64 {
 		count++
 	}
 	return count
+}
+
+// bsegToResult converts a bseg.Record to a recrawler.Result.
+func bsegToResult(r *bseg.Record) recrawler.Result {
+	return recrawler.Result{
+		URL:           r.URL,
+		StatusCode:    int(r.StatusCode),
+		ContentType:   r.ContentType,
+		ContentLength: r.ContentLen,
+		BodyCID:       r.BodyCID,
+		Title:         r.Title,
+		Description:   r.Description,
+		Language:      r.Language,
+		Domain:        r.Domain,
+		RedirectURL:   r.RedirectURL,
+		FetchTimeMs:   r.FetchMs,
+		CrawledAt:     time.UnixMilli(r.CrawledMs),
+		Error:         r.Error,
+	}
+}
+
+// ── legacy gob support ────────────────────────────────────────────────────────
+
+// binRecord is the legacy gob serialization type for old .bseg files.
+// Kept only for backward-compatible drainSegGob reads.
+type binRecord struct {
+	URL           string
+	StatusCode    int
+	ContentType   string
+	ContentLength int64
+	BodyCID       string
+	Title         string
+	Description   string
+	Language      string
+	Domain        string
+	RedirectURL   string
+	FetchTimeMs   int64
+	CrawledAtMs   int64
+	Error         string
+	Failed        bool
+}
+
+func (r *binRecord) toResult() recrawler.Result {
+	return recrawler.Result{
+		URL:           r.URL,
+		StatusCode:    r.StatusCode,
+		ContentType:   r.ContentType,
+		ContentLength: r.ContentLength,
+		BodyCID:       r.BodyCID,
+		Title:         r.Title,
+		Description:   r.Description,
+		Language:      r.Language,
+		Domain:        r.Domain,
+		RedirectURL:   r.RedirectURL,
+		FetchTimeMs:   r.FetchTimeMs,
+		CrawledAt:     time.UnixMilli(r.CrawledAtMs),
+		Error:         r.Error,
+	}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
