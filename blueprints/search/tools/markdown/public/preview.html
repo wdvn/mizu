@@ -4,6 +4,9 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Preview — markdown.go-mizu</title>
+  <script>
+  (function(){var t=localStorage.getItem('theme');if(t)document.documentElement.setAttribute('data-theme',t);})();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -11,78 +14,102 @@
   <script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
   <link rel="stylesheet" href="/styles.css">
   <style>
-/* top bar — Google search results style: icon + url + button in one row */
-.top-bar{width:100%;border-bottom:1px solid var(--border2);padding:10px 20px;display:flex;align-items:center;gap:14px}
+.top-bar{width:100%;border-bottom:1px solid var(--border);padding:10px 20px;display:flex;align-items:center;gap:12px;background:var(--bg)}
 .top-bar .logo-sq{flex-shrink:0}
 .url-form{flex:1;display:flex;max-width:860px}
-/* states */
+
+/* empty state */
+.empty-state{display:none;padding:100px 32px;text-align:center}
+.empty-txt{font-size:14px;color:var(--fg3);margin-bottom:14px}
+.empty-links{font-size:13px;color:var(--fg3)}
+.empty-eg{color:var(--fg2);cursor:pointer;text-decoration:underline;text-decoration-color:var(--border2);transition:color .15s}
+.empty-eg:hover{color:var(--fg)}
+.empty-icon{width:40px;height:40px;margin:0 auto 20px;color:var(--fg3)}
+
+/* loading / error states */
 .loading-state{display:none;padding:80px 32px;text-align:center}
-.spinner{margin-right:10px;vertical-align:middle}
-.loading-txt{font-size:14px;color:var(--fg3);vertical-align:middle}
+.loading-txt{font-size:14px;color:var(--fg3);vertical-align:middle;margin-left:10px}
 .error-state{display:none;padding:32px}
-.error-box{max-width:var(--w);margin:0 auto;background:#fff5f5;border:1px solid #fecaca;padding:16px 20px;font-size:14px;color:#b91c1c}
+.error-box{max-width:var(--w);margin:0 auto;background:var(--bg2);border:1px solid var(--border2);padding:16px 20px;font-size:14px;color:var(--fg2)}
 .result-state{display:none}
+
 /* meta bar */
-.meta-bar{width:100%;padding:14px 32px;border-bottom:1px solid var(--border2)}
+.meta-bar{width:100%;padding:12px 32px;border-bottom:1px solid var(--border);background:var(--bg)}
 .meta-inner{max-width:var(--w);margin:0 auto;display:flex;align-items:center;gap:10px}
-.r-title{flex:1;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.r-raw{font-size:13px;color:var(--fg3);white-space:nowrap;flex-shrink:0}
+.r-title{flex:1;font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--fg)}
+.r-raw{font-size:13px;color:var(--fg3);white-space:nowrap;flex-shrink:0;text-decoration:underline;text-decoration-color:var(--border2);transition:color .15s}
 .r-raw:hover{color:var(--fg)}
+
 /* tab bar */
-.tab-bar{width:100%;padding:0 32px;border-bottom:1px solid var(--border2)}
+.tab-bar{width:100%;padding:0 32px;border-bottom:1px solid var(--border);background:var(--bg)}
 .tab-bar-inner{max-width:var(--w);margin:0 auto;display:flex;align-items:center;justify-content:space-between}
 .tabs{display:flex}
 .tab{font-size:13px;padding:12px 16px;background:none;border:none;border-bottom:2px solid transparent;margin-bottom:-1px;cursor:pointer;color:var(--fg3);transition:color .15s,border-color .15s;font-family:var(--sans)}
 .tab.on{color:var(--fg);border-bottom-color:var(--fg)}
 .tab-actions{display:flex;gap:8px}
-.act-btn{font-family:var(--sans);font-size:13px;padding:7px 14px;background:#fff;color:var(--fg2);border:1px solid transparent;cursor:pointer;transition:border-color .15s,color .15s}
-.act-btn:hover{border:1px solid var(--border2);color:var(--fg)}
+.act-btn{font-family:var(--sans);font-size:13px;padding:7px 14px;background:var(--bg);color:var(--fg2);border:1px solid var(--border);cursor:pointer;transition:border-color .15s,color .15s}
+.act-btn:hover{border-color:var(--border2);color:var(--fg)}
+
 /* panels */
 .panel{display:none}
 .panel.on{display:block}
-.md-panel{padding:32px}
-.pv-panel{padding:32px}
+.md-panel{padding:32px;background:var(--bg)}
+.pv-panel{padding:32px;background:var(--bg)}
 .md-wrap{max-width:var(--w);margin:0 auto}
 .pv-wrap{max-width:860px;margin:0 auto}
 #md-out{font-family:var(--mono);font-size:13.5px;line-height:1.75;white-space:pre-wrap;color:var(--fg)}
-/* prose */
-#prev-out h1{font-size:1.6em;font-weight:600;margin-bottom:16px;letter-spacing:-.02em}
-#prev-out h2{font-size:1.3em;font-weight:600;margin:24px 0 12px}
-#prev-out h3{font-size:1.1em;font-weight:600;margin:20px 0 10px}
-#prev-out h4,#prev-out h5,#prev-out h6{font-weight:600;margin:16px 0 8px}
-#prev-out p{color:#333;line-height:1.75;margin-bottom:14px}
+
+/* prose preview */
+#prev-out h1{font-size:1.6em;font-weight:600;margin-bottom:16px;letter-spacing:-.02em;color:var(--fg)}
+#prev-out h2{font-size:1.3em;font-weight:600;margin:24px 0 12px;color:var(--fg)}
+#prev-out h3{font-size:1.1em;font-weight:600;margin:20px 0 10px;color:var(--fg)}
+#prev-out h4,#prev-out h5,#prev-out h6{font-weight:600;margin:16px 0 8px;color:var(--fg)}
+#prev-out p{color:var(--fg2);line-height:1.75;margin-bottom:14px}
 #prev-out ul,#prev-out ol{padding-left:24px;margin-bottom:14px}
-#prev-out li{line-height:1.7;color:#333}
-#prev-out code{font-family:var(--mono);font-size:12px;background:#f5f5f5;padding:1px 5px}
-#prev-out pre{background:#111;padding:20px;overflow-x:auto;margin-bottom:16px}
-#prev-out pre code{background:none;padding:0;color:#e4e4e7;font-size:13px}
+#prev-out li{line-height:1.7;color:var(--fg2)}
+#prev-out code{font-family:var(--mono);font-size:12px;background:var(--bg2);padding:1px 5px;color:var(--fg)}
+#prev-out pre{background:var(--code-bg);padding:20px;overflow-x:auto;margin-bottom:16px}
+#prev-out pre code{background:none;padding:0;color:var(--code-fg);font-size:13px}
 #prev-out blockquote{border-left:3px solid var(--border2);padding-left:16px;color:var(--fg3);margin-bottom:14px}
-#prev-out a{color:#1a73e8;text-decoration:underline;text-decoration-color:#c7d7f5}
-#prev-out a:hover{text-decoration-color:#1a73e8}
+#prev-out a{color:var(--fg);text-decoration:underline;text-decoration-color:var(--border2)}
+#prev-out a:hover{text-decoration-color:var(--fg)}
 #prev-out table{width:100%;border-collapse:collapse;margin-bottom:16px;font-size:14px}
-#prev-out th,#prev-out td{border:1px solid var(--border2);padding:8px 12px;text-align:left}
-#prev-out th{background:#fafafa;font-weight:600}
-#prev-out hr{border:none;border-top:1px solid var(--border2);margin:24px 0}
+#prev-out th,#prev-out td{border:1px solid var(--border2);padding:8px 12px;text-align:left;color:var(--fg2)}
+#prev-out th{background:var(--bg2);font-weight:600;color:var(--fg)}
+#prev-out hr{border:none;border-top:1px solid var(--border);margin:24px 0}
 #prev-out img{max-width:100%;height:auto}
   </style>
 </head>
 <body>
 
 <div class="top-bar">
-  <a href="/" class="logo-sq" title="URL → Markdown">
-    <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect width="16" height="12" x="4" y="6" rx="1"/>
-      <path d="M4 12h2l2-2 2 2 2-4 2 4 2-2h2"/>
+  <a href="/" class="logo-sq" title="markdown.go-mizu">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--bg)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="3" width="18" height="18" rx="2"/>
+      <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
     </svg>
   </a>
   <form class="url-form" id="form" onsubmit="handleSubmit(event)">
     <input id="url-in" type="url" class="url-in" placeholder="https://example.com" autocomplete="off" spellcheck="false">
     <button type="submit" id="sub-btn" class="cvt-btn"><span id="btn-sp" style="display:none" class="spinner"></span><span id="btn-t">Convert</span></button>
   </form>
+  <button class="theme-toggle" id="theme-toggle" onclick="toggleTheme()" title="Toggle dark mode">
+    <svg id="icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9z"/></svg>
+    <svg id="icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg>
+  </button>
+</div>
+
+<div class="empty-state" id="empty-state">
+  <svg class="empty-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="3" y="3" width="18" height="18" rx="2"/>
+    <path d="M8 16V8.5a.5.5 0 0 1 .9-.3l2.7 3.6a.5.5 0 0 0 .8 0l2.7-3.6a.5.5 0 0 1 .9.3V16"/>
+  </svg>
+  <p class="empty-txt">Enter a URL above to preview its Markdown output.</p>
+  <div class="empty-links">Try: <span class="empty-eg" onclick="setPreviewEg('https://example.com')">example.com</span> &middot; <span class="empty-eg" onclick="setPreviewEg('https://news.ycombinator.com')">news.ycombinator.com</span> &middot; <span class="empty-eg" onclick="setPreviewEg('https://docs.python.org/3/')">docs.python.org</span></div>
 </div>
 
 <div class="loading-state" id="loading-state">
-  <span class="spinner"></span>
+  <span class="spinner" style="vertical-align:middle"></span>
   <span class="loading-txt">Converting…</span>
 </div>
 
@@ -91,17 +118,15 @@
 </div>
 
 <div class="result-state" id="result-state">
-
   <div class="meta-bar">
     <div class="meta-inner">
       <span class="r-title" id="r-title"></span>
-      <span class="badge b-ai" id="r-method"></span>
+      <span class="badge b-dim" id="r-method"></span>
       <span class="badge b-dim" id="r-dur"></span>
       <span class="badge b-dim" id="r-tok" style="display:none"></span>
-      <a class="r-raw" id="r-raw" href="#" target="_blank" rel="noopener">View raw →</a>
+      <a class="r-raw" id="r-raw" href="#" target="_blank" rel="noopener">raw ↗</a>
     </div>
   </div>
-
   <div class="tab-bar">
     <div class="tab-bar-inner">
       <div class="tabs">
@@ -114,30 +139,17 @@
       </div>
     </div>
   </div>
-
   <div id="panel-md" class="panel md-panel on">
-    <div class="md-wrap">
-      <pre id="md-out"></pre>
-    </div>
+    <div class="md-wrap"><pre id="md-out"></pre></div>
   </div>
-
   <div id="panel-pv" class="panel pv-panel">
-    <div class="pv-wrap">
-      <div id="prev-out"></div>
-    </div>
+    <div class="pv-wrap"><div id="prev-out"></div></div>
   </div>
-
 </div>
 
 <script>
 var md = '';
 var currentUrl = '';
-
-var METHOD_MAP = {
-  primary: ['✦ Native', 'badge b-native'],
-  ai:      ['⚡ Workers AI', 'badge b-ai'],
-  browser: ['🖥 Browser', 'badge b-browser'],
-};
 
 function handleSubmit(e) {
   e.preventDefault();
@@ -147,11 +159,17 @@ function handleSubmit(e) {
   convertUrl(url);
 }
 
+function setPreviewEg(url) {
+  document.getElementById('url-in').value = url;
+  convertUrl(url);
+}
+
 function setLoading(v) {
   document.getElementById('sub-btn').disabled = v;
   document.getElementById('btn-t').textContent = v ? 'Converting…' : 'Convert';
   document.getElementById('btn-sp').style.display = v ? '' : 'none';
   document.getElementById('loading-state').style.display = v ? 'block' : 'none';
+  document.getElementById('empty-state').style.display = 'none';
 }
 
 async function convertUrl(url) {
@@ -180,15 +198,12 @@ async function convertUrl(url) {
 }
 
 function showResult(data) {
-  // Strip horizontal rules (--- / *** / ___) — too noisy in scraped content
   md = (data.markdown || '').replace(/^[-*_]{3,}\s*$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
   document.getElementById('r-title').textContent = data.title || currentUrl;
-  var cfg = METHOD_MAP[data.method] || METHOD_MAP.ai;
-  var mb = document.getElementById('r-method');
-  mb.textContent = cfg[0]; mb.className = cfg[1];
+  document.getElementById('r-method').textContent = data.method || '';
   document.getElementById('r-dur').textContent = data.durationMs + 'ms';
   var tb = document.getElementById('r-tok');
-  if (data.tokens) { tb.textContent = '~' + data.tokens.toLocaleString() + ' tokens'; tb.style.display = ''; }
+  if (data.tokens) { tb.textContent = '~' + data.tokens.toLocaleString() + ' tok'; tb.style.display = ''; }
   else { tb.style.display = 'none'; }
   document.getElementById('r-raw').href = '/' + currentUrl;
   document.getElementById('md-out').textContent = md;
@@ -201,8 +216,8 @@ function showResult(data) {
 
 function switchTab(t) {
   ['md','pv'].forEach(function(k) {
-    document.getElementById('panel-' + k).className = 'panel' + (k === t ? ' on' : '') + (k === 'md' ? ' md-panel' : ' pv-panel');
-    document.getElementById('tab-' + k).className = 'tab' + (k === t ? ' on' : '');
+    document.getElementById('panel-'+k).className = 'panel'+(k===t?' on':'')+(k==='md'?' md-panel':' pv-panel');
+    document.getElementById('tab-'+k).className = 'tab'+(k===t?' on':'');
   });
 }
 
@@ -224,19 +239,32 @@ function saveMd() {
   a.href = URL.createObjectURL(blob);
   var title = document.getElementById('r-title').textContent || 'document';
   a.download = title.replace(/[^\w\s-]/g,'').trim().replace(/\s+/g,'-').toLowerCase() + '.md';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
   setTimeout(function() { URL.revokeObjectURL(a.href); }, 100);
 }
 
+function updateToggleIcon() {
+  var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+  document.getElementById('icon-moon').style.display = dark ? 'none' : '';
+  document.getElementById('icon-sun').style.display = dark ? '' : 'none';
+}
+
+function toggleTheme() {
+  var cur = document.documentElement.getAttribute('data-theme');
+  var next = cur === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  localStorage.setItem('theme', next);
+  updateToggleIcon();
+}
+
 window.addEventListener('load', function() {
+  updateToggleIcon();
   var params = new URLSearchParams(window.location.search);
   var url = params.get('url');
   if (url) {
     convertUrl(url);
   } else {
-    document.getElementById('url-in').focus();
+    document.getElementById('empty-state').style.display = 'block';
   }
 });
 </script>
