@@ -212,7 +212,7 @@ remote-recrawl-bg: ## Run cc recrawl --file p:0 (full body, 500 workers) on remo
 remote-tail: ## Tail recrawl log on remote
 	@$(SSH) $(REMOTE_SSH) 'tail -f ~/recrawl.log'
 
-CC_RECRAWL_FLAGS ?= --domain-fail-threshold 0 --domain-timeout 0 --batch-size 5000 --workers 4096 --timeout 2000 --max-conns-per-domain 2
+CC_RECRAWL_FLAGS ?= --domain-fail-threshold 0 --domain-timeout 0 --batch-size 5000 --workers 2048 --timeout 2000 --max-conns-per-domain 2 --db-shards 4
 
 .PHONY: remote-cc-recrawl-p0
 remote-cc-recrawl-p0: ## Launch cc recrawl --file p:0 in background (~/cc-p0.log)
@@ -243,14 +243,22 @@ remote-cc-recrawl-all: remote-cc-recrawl-p0 remote-cc-recrawl-p200 \
                         remote-cc-recrawl-p400 remote-cc-recrawl-p600 ## Launch all 4 cc recrawl partitions in background (parallel)
 
 .PHONY: remote-cc-recrawl-sequential
-remote-cc-recrawl-sequential: ## Run p:0 → p:100 → p:200 → p:299 sequentially in background (safer for low-RAM servers)
-	@$(SSH) $(REMOTE_SSH) 'nohup bash -c " \
+remote-cc-recrawl-sequential: ## Run p:0→p:100→p:200→p:299 sequentially in a named screen session (survives SSH disconnect)
+	@$(SSH) $(REMOTE_SSH) 'screen -dmS cc-sequential bash -c " \
 		~/bin/search cc recrawl --file p:0   $(CC_RECRAWL_FLAGS) >~/cc-p0.log   2>&1; \
 		~/bin/search cc recrawl --file p:100 $(CC_RECRAWL_FLAGS) >~/cc-p100.log 2>&1; \
 		~/bin/search cc recrawl --file p:200 $(CC_RECRAWL_FLAGS) >~/cc-p200.log 2>&1; \
 		~/bin/search cc recrawl --file p:299 $(CC_RECRAWL_FLAGS) >~/cc-p299.log 2>&1; \
-		echo ALL_DONE \
-	" >~/cc-sequential.log 2>&1 & echo PID:$$!'
+		echo ALL_DONE; exec bash \
+	"; echo "Screen session cc-sequential started (attach: screen -r cc-sequential)"'
+
+.PHONY: remote-cc-screen-attach
+remote-cc-screen-attach: ## Attach to cc-sequential screen session on remote server
+	@$(SSH) -t $(REMOTE_SSH) 'screen -r cc-sequential'
+
+.PHONY: remote-cc-screen-kill
+remote-cc-screen-kill: ## Kill the cc-sequential screen session on remote server
+	@$(SSH) $(REMOTE_SSH) 'screen -S cc-sequential -X quit 2>/dev/null && echo "Killed" || echo "No session found"'
 
 .PHONY: remote-cc-tail-p0
 remote-cc-tail-p0: ## Tail cc recrawl p:0 log
