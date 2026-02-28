@@ -42,7 +42,7 @@ type binRecord struct {
 	StatusCode    int
 	ContentType   string
 	ContentLength int64
-	Body          string
+	BodyCID       string // CAS reference; "" = body not stored
 	Title         string
 	Description   string
 	Language      string
@@ -60,7 +60,7 @@ func (r *binRecord) toResult() recrawler.Result {
 		StatusCode:    r.StatusCode,
 		ContentType:   r.ContentType,
 		ContentLength: r.ContentLength,
-		Body:          r.Body,
+		BodyCID:       r.BodyCID,
 		Title:         r.Title,
 		Description:   r.Description,
 		Language:      r.Language,
@@ -204,7 +204,7 @@ func (w *BinSegWriter) writeOne(r recrawler.Result) {
 	jr.StatusCode    = r.StatusCode
 	jr.ContentType   = binSanitize(r.ContentType)
 	jr.ContentLength = r.ContentLength
-	jr.Body          = binSanitize(r.Body)
+	jr.BodyCID       = r.BodyCID
 	jr.Title         = binSanitize(r.Title)
 	jr.Description   = binSanitize(r.Description)
 	jr.Language      = binSanitize(r.Language)
