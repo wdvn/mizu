@@ -1,4 +1,4 @@
-package recrawler
+package store
 
 import (
 	"testing"

@@ -1,43 +1,27 @@
-// Package recrawler provides a high-throughput recrawler for known URL sets.
-// It reads seed URLs from DuckDB, crawls them with maximum parallelism,
-// and stores results and state in separate DuckDB files.
+// Package recrawler is deprecated. Use pkg/crawl and pkg/crawl/store instead.
+// This file re-exports types for backward compatibility.
 package recrawler
 
-import "time"
+import (
+	"time"
 
-// SeedURL represents a URL loaded from the seed database.
-// Domain is the registered domain; Host is the URL hostname used for DNS/IP dialing.
-type SeedURL struct {
-	URL    string
-	Domain string
-	Host   string
-}
+	crawl "github.com/go-mizu/mizu/blueprints/search/pkg/crawl"
+)
+
+// Type aliases pointing to their new homes in pkg/crawl.
+type SeedURL = crawl.SeedURL
+type Result = crawl.Result
+type FailedURL = crawl.FailedURL
+type FailedDomain = crawl.FailedDomain
 
 // SeedStats holds aggregate stats about the seed database.
+// Kept here to avoid breaking callers; mirrors store.SeedStats.
 type SeedStats struct {
 	TotalURLs     int
 	UniqueDomains int
 	Protocols     map[string]int // HTTP vs HTTPS
 	ContentTypes  map[string]int
 	TLDs          map[string]int
-}
-
-// Result holds the result of recrawling a single URL.
-type Result struct {
-	URL           string
-	StatusCode    int
-	ContentType   string
-	ContentLength int64
-	Body          string // HTML body (full content mode)
-	BodyCID       string // CAS reference e.g. "sha256:{hex64}"; "" = not stored
-	Title         string
-	Description   string
-	Language      string
-	Domain        string
-	RedirectURL   string
-	FetchTimeMs   int64
-	CrawledAt     time.Time
-	Error         string
 }
 
 // Config holds configuration for high-throughput recrawling.

@@ -110,6 +110,16 @@ type FailureWriter interface {
 	Close() error
 }
 
+// DroneResultDBFactory is set by pkg/crawl/store via init() to break the import cycle.
+// swarm_drone.go calls this to create a ResultDB without importing store directly.
+// Signature matches store.NewResultDB.
+var DroneResultDBFactory func(dir string, shardCount, batchSize, duckMemPerShardMB int) (ResultWriter, error)
+
+// DroneFailedDBFactory is set by pkg/crawl/store via init() to break the import cycle.
+// swarm_drone.go calls this to create a FailedDB without importing store directly.
+// Signature matches store.OpenFailedDB.
+var DroneFailedDBFactory func(path string) (FailureWriter, error)
+
 // New returns the named engine. Valid names: "keepalive", "epoll", "swarm", "rawhttp".
 func New(name string) (Engine, error) {
 	switch name {

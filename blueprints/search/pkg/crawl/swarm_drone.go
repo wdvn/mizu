@@ -19,7 +19,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/go-mizu/mizu/blueprints/search/pkg/archived/recrawler"
 	"github.com/go-mizu/mizu/blueprints/search/pkg/crawler"
 	"golang.org/x/sync/errgroup"
 )
@@ -167,27 +166,6 @@ func parseRawFetch(rf rawFetch) Result {
 	}
 }
 
-// toRecrawlerResult converts a crawl.Result to recrawler.Result for the legacy
-// recrawler.ResultDB used by the drone. Fields are identical; this is a bridge
-// needed until swarm_drone.go is migrated to use store.ResultDB (Task 3).
-func toRecrawlerResult(r Result) recrawler.Result {
-	return recrawler.Result{
-		URL:           r.URL,
-		StatusCode:    r.StatusCode,
-		ContentType:   r.ContentType,
-		ContentLength: r.ContentLength,
-		Body:          r.Body,
-		BodyCID:       r.BodyCID,
-		Title:         r.Title,
-		Description:   r.Description,
-		Language:      r.Language,
-		Domain:        r.Domain,
-		RedirectURL:   r.RedirectURL,
-		FetchTimeMs:   r.FetchTimeMs,
-		CrawledAt:     r.CrawledAt,
-		Error:         r.Error,
-	}
-}
 
 // RunDrone is the entry point for the hidden "cc recrawl-drone" subcommand.
 // It reads a DNS frame + seed URLs from stdin, runs the 3-stage pipeline,
@@ -216,19 +194,25 @@ func RunDrone(ctx context.Context, cfg Config) error {
 		return fmt.Errorf("mkdir result dir: %w", err)
 	}
 	batchSz := max(cfg.BatchSize, 50)
-	rdb, err := recrawler.NewResultDB(cfg.SwarmResultDir, 8, batchSz, 0)
+	if DroneResultDBFactory == nil {
+		return fmt.Errorf("DroneResultDBFactory not set; import pkg/crawl/store to initialize")
+	}
+	rdb, err := DroneResultDBFactory(cfg.SwarmResultDir, 8, batchSz, 0)
 	if err != nil {
 		return fmt.Errorf("open result db: %w", err)
 	}
 	defer rdb.Close()
 
 	// Open failed DB (optional – no error if path is empty).
-	var failDB *recrawler.FailedDB
+	var failDB FailureWriter
 	if cfg.SwarmFailedDB != "" {
 		if err := os.MkdirAll(filepath.Dir(cfg.SwarmFailedDB), 0o755); err != nil {
 			return fmt.Errorf("mkdir failed db dir: %w", err)
 		}
-		failDB, err = recrawler.OpenFailedDB(cfg.SwarmFailedDB)
+		if DroneFailedDBFactory == nil {
+			return fmt.Errorf("DroneFailedDBFactory not set; import pkg/crawl/store to initialize")
+		}
+		failDB, err = DroneFailedDBFactory(cfg.SwarmFailedDB)
 		if err != nil {
 			return fmt.Errorf("open failed db: %w", err)
 		}
@@ -243,7 +227,7 @@ func RunDrone(ctx context.Context, cfg Config) error {
 	var writeWg sync.WaitGroup
 	writeWg.Go(func() {
 		for r := range writeCh {
-			rdb.Add(toRecrawlerResult(r))
+			rdb.Add(r)
 		}
 		rdb.Flush(context.Background()) //nolint:errcheck
 	})
@@ -261,7 +245,7 @@ func RunDrone(ctx context.Context, cfg Config) error {
 				case r.Error != "" && isTimeoutErr(r.Error):
 					timeoutCount.Add(1)
 					if failDB != nil {
-						failDB.AddURL(recrawler.FailedURL{
+						failDB.AddURL(FailedURL{
 							URL: r.URL, Domain: r.Domain,
 							Reason: "http_timeout", Error: r.Error,
 							FetchTimeMs: r.FetchTimeMs,
@@ -270,7 +254,7 @@ func RunDrone(ctx context.Context, cfg Config) error {
 				case r.Error != "":
 					failCount.Add(1)
 					if failDB != nil {
-						failDB.AddURL(recrawler.FailedURL{
+						failDB.AddURL(FailedURL{
 							URL: r.URL, Domain: r.Domain,
 							Reason: "http_error", Error: r.Error,
 							FetchTimeMs: r.FetchTimeMs,
@@ -333,7 +317,7 @@ func RunDrone(ctx context.Context, cfg Config) error {
 // Each domain's URLs go to one inner goroutine group sharing a single http.Transport.
 // Results are sent to fetchCh (never calling crawler.Extract).
 func runSwarmFetch(ctx context.Context, seeds []SeedURL,
-	dns DNSCache, cfg Config, trk *adaptiveTracker, fetchCh chan<- rawFetch, failDB *recrawler.FailedDB) {
+	dns DNSCache, cfg Config, trk *adaptiveTracker, fetchCh chan<- rawFetch, failDB FailureWriter) {
 
 	byDomain := make(map[string][]SeedURL, 1024)
 	for _, s := range seeds {
@@ -343,7 +327,7 @@ func runSwarmFetch(ctx context.Context, seeds []SeedURL,
 		}
 		if dns.IsDead(h) {
 			if failDB != nil {
-				failDB.AddURL(recrawler.FailedURL{
+				failDB.AddURL(FailedURL{
 					URL: s.URL, Domain: s.Domain, Reason: "domain_dead",
 				})
 			}
@@ -391,7 +375,7 @@ func runSwarmFetch(ctx context.Context, seeds []SeedURL,
 // It mirrors processOneDomain from keepalive.go but sends rawFetch to fetchCh.
 func swarmProcessDomain(ctx context.Context, urls []SeedURL,
 	dns DNSCache, cfg Config, trk *adaptiveTracker, innerN int, fetchCh chan<- rawFetch,
-	failDB *recrawler.FailedDB) {
+	failDB FailureWriter) {
 
 	if len(urls) == 0 {
 		return
@@ -456,7 +440,7 @@ func swarmProcessDomain(ctx context.Context, urls []SeedURL,
 				select {
 				case <-abandonCh:
 					if failDB != nil {
-						failDB.AddURL(recrawler.FailedURL{
+						failDB.AddURL(FailedURL{
 							URL: seed.URL, Domain: seed.Domain,
 							Reason: "domain_http_timeout_killed",
 						})
@@ -468,7 +452,7 @@ func swarmProcessDomain(ctx context.Context, urls []SeedURL,
 					select {
 					case <-domainCtx.Done():
 						if failDB != nil {
-							failDB.AddURL(recrawler.FailedURL{
+							failDB.AddURL(FailedURL{
 								URL: seed.URL, Domain: seed.Domain,
 								Reason: "domain_deadline_exceeded",
 							})
