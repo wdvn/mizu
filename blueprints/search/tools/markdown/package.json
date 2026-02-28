@@ -8,12 +8,13 @@
     "type-check": "tsc --noEmit"
   },
   "dependencies": {
+    "@cloudflare/puppeteer": "^1.0.6",
     "hono": "^4.11.8",
-    "@cloudflare/puppeteer": "^1.0.6"
+    "marked": "^17.0.3"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20260207.0",
-    "wrangler": "^4.63.0",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "wrangler": "^4.63.0"
   }
 }

@@ -12,6 +12,10 @@ binding = "AI"
 [browser]
 binding = "BROWSER"
 
+[[rules]]
+type = "Text"
+globs = ["**/*.md"]
+
 [assets]
 directory = "./public"
 binding = "ASSETS"

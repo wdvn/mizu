@@ -1,9 +1,14 @@
 import { Hono } from 'hono';
+import { marked } from 'marked';
 import { convert } from './convert';
 import { renderDocs } from './docs';
+import docsMarkdown from './content/docs.md';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type Env = { AI: any; BROWSER: Fetcher; ASSETS: Fetcher };
+
+// Cached once per worker isolate lifetime
+let cachedDocsHtml: string | null = null;
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -95,7 +100,13 @@ app.options('/*', (c) => {
 });
 
 // Docs page
-app.get('/docs', (c) => c.html(renderDocs()));
+app.get('/docs', (c) => {
+  if (!cachedDocsHtml) {
+    const rendered = marked.parse(docsMarkdown);
+    cachedDocsHtml = typeof rendered === 'string' ? rendered : '';
+  }
+  return c.html(renderDocs(cachedDocsHtml));
+});
 
 // Text API: GET /:url+ (mirrors markdown.new/https://example.com pattern)
 // Matches any path starting with http:// or https://
