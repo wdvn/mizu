@@ -240,7 +240,17 @@ remote-cc-recrawl-p600: ## Launch cc recrawl --file p:600 in background (~/cc-p6
 
 .PHONY: remote-cc-recrawl-all
 remote-cc-recrawl-all: remote-cc-recrawl-p0 remote-cc-recrawl-p200 \
-                        remote-cc-recrawl-p400 remote-cc-recrawl-p600 ## Launch all 4 cc recrawl partitions in background
+                        remote-cc-recrawl-p400 remote-cc-recrawl-p600 ## Launch all 4 cc recrawl partitions in background (parallel)
+
+.PHONY: remote-cc-recrawl-sequential
+remote-cc-recrawl-sequential: ## Run p:0 → p:100 → p:200 → p:299 sequentially in background (safer for low-RAM servers)
+	@$(SSH) $(REMOTE_SSH) 'nohup bash -c " \
+		~/bin/search cc recrawl --file p:0   $(CC_RECRAWL_FLAGS) >~/cc-p0.log   2>&1; \
+		~/bin/search cc recrawl --file p:100 $(CC_RECRAWL_FLAGS) >~/cc-p100.log 2>&1; \
+		~/bin/search cc recrawl --file p:200 $(CC_RECRAWL_FLAGS) >~/cc-p200.log 2>&1; \
+		~/bin/search cc recrawl --file p:299 $(CC_RECRAWL_FLAGS) >~/cc-p299.log 2>&1; \
+		echo ALL_DONE \
+	" >~/cc-sequential.log 2>&1 & echo PID:$$!'
 
 .PHONY: remote-cc-tail-p0
 remote-cc-tail-p0: ## Tail cc recrawl p:0 log
