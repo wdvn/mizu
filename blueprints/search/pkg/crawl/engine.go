@@ -58,6 +58,12 @@ type Config struct {
 	// ProgressFunc is called by the swarm engine every 500ms with cumulative
 	// ok/failed/timeout totals from all drones. Nil-safe.
 	ProgressFunc func(ok, failed, timeout int64)
+
+	// BodyStore is optional. When set, HTML bodies are written to the CAS store
+	// and Result.BodyCID is populated; Result.Body is left empty.
+	BodyStore interface {
+		Put(body []byte) (cid string, err error)
+	}
 }
 
 // DomainNotifier receives domain lifecycle events from the engine.
