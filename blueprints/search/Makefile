@@ -168,7 +168,7 @@ deploy-linux-noble: build-linux-noble ## Deploy Ubuntu 24.04 binary to remote $$
 	@$(SSH) $(REMOTE_SSH) 'bash -lc "set -e; \
 		install -m 0755 $$HOME/.search-upload.tmp $$HOME/bin/search-linux-noble; \
 		rm -f $$HOME/.search-upload.tmp; \
-		printf '"'"'#!/usr/bin/env bash\nulimit -n 65536 2>/dev/null || true\nexport GOMEMLIMIT=2000000000\nexport GODEBUG=netdns=go\nexec \"$$HOME/bin/search-linux-noble\" \"\$$@\"\n'"'"' > $$HOME/bin/search; \
+		printf '"'"'#!/usr/bin/env bash\nulimit -Hn 131072 2>/dev/null; ulimit -n 131072 2>/dev/null || ulimit -n 65536 2>/dev/null || true\nexport GOMEMLIMIT=2000000000\nexport GODEBUG=netdns=go\nexec \"$$HOME/bin/search-linux-noble\" \"\$$@\"\n'"'"' > $$HOME/bin/search; \
 		chmod +x $$HOME/bin/search"'
 	@echo "Deployed Noble: $(REMOTE_SSH):~/bin/search"
 
@@ -211,6 +211,48 @@ remote-recrawl-bg: ## Run cc recrawl --file p:0 (full body, 500 workers) on remo
 .PHONY: remote-tail
 remote-tail: ## Tail recrawl log on remote
 	@$(SSH) $(REMOTE_SSH) 'tail -f ~/recrawl.log'
+
+CC_RECRAWL_FLAGS ?= --domain-fail-threshold 0 --domain-timeout 0 --batch-size 5000
+
+.PHONY: remote-cc-recrawl-p0
+remote-cc-recrawl-p0: ## Launch cc recrawl --file p:0 in background (~/cc-p0.log)
+	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:0 $(CC_RECRAWL_FLAGS) >~/cc-p0.log 2>&1 & echo PID:$$!'
+
+.PHONY: remote-cc-recrawl-p200
+remote-cc-recrawl-p200: ## Launch cc recrawl --file p:200 in background (~/cc-p200.log)
+	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:200 $(CC_RECRAWL_FLAGS) >~/cc-p200.log 2>&1 & echo PID:$$!'
+
+.PHONY: remote-cc-recrawl-p400
+remote-cc-recrawl-p400: ## Launch cc recrawl --file p:400 in background (~/cc-p400.log)
+	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:400 $(CC_RECRAWL_FLAGS) >~/cc-p400.log 2>&1 & echo PID:$$!'
+
+.PHONY: remote-cc-recrawl-p600
+remote-cc-recrawl-p600: ## Launch cc recrawl --file p:600 in background (~/cc-p600.log)
+	@$(SSH) $(REMOTE_SSH) 'nohup ~/bin/search cc recrawl --file p:600 $(CC_RECRAWL_FLAGS) >~/cc-p600.log 2>&1 & echo PID:$$!'
+
+.PHONY: remote-cc-recrawl-all
+remote-cc-recrawl-all: remote-cc-recrawl-p0 remote-cc-recrawl-p200 \
+                        remote-cc-recrawl-p400 remote-cc-recrawl-p600 ## Launch all 4 cc recrawl partitions in background
+
+.PHONY: remote-cc-tail-p0
+remote-cc-tail-p0: ## Tail cc recrawl p:0 log
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p0.log'
+
+.PHONY: remote-cc-tail-p200
+remote-cc-tail-p200: ## Tail cc recrawl p:200 log
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p200.log'
+
+.PHONY: remote-cc-tail-p400
+remote-cc-tail-p400: ## Tail cc recrawl p:400 log
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p400.log'
+
+.PHONY: remote-cc-tail-p600
+remote-cc-tail-p600: ## Tail cc recrawl p:600 log
+	@$(SSH) $(REMOTE_SSH) 'tail -f ~/cc-p600.log'
+
+.PHONY: remote-cc-status
+remote-cc-status: ## Show last 2 lines of all 4 cc recrawl logs
+	@$(SSH) $(REMOTE_SSH) 'tail -n2 ~/cc-p0.log ~/cc-p200.log ~/cc-p400.log ~/cc-p600.log 2>/dev/null'
 
 .PHONY: remote-hn-recrawl
 remote-hn-recrawl: ## Run hn recrawl (keepalive, auto-config) on remote server
