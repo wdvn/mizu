@@ -122,6 +122,6 @@ const md = await fetch(
 ## Limits
 
 - Max response body: **5 MB** per URL
-- Fetch timeout: **10 seconds** (30 seconds for browser rendering)
+- Fetch timeout: **10 seconds** (20 seconds for browser rendering)
 - Protocols: **http://** and **https://** only
 - No hard rate limit for reasonable use
