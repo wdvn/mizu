@@ -984,7 +984,7 @@ Examples:
 	cmd.Flags().StringVar(&domain, "domain", "", "Domain filter")
 	cmd.Flags().StringVar(&tld, "tld", "", "TLD filter (e.g. com)")
 	cmd.Flags().IntVar(&limit, "limit", 0, "Max URLs to recrawl (0=all from index)")
-	cmd.Flags().IntVar(&batchSize, "batch-size", 10, "DB write batch size")
+	cmd.Flags().IntVar(&batchSize, "batch-size", 5000, "DB write batch size")
 	cmd.Flags().StringVar(&engine, "engine", "keepalive", "Crawl engine: keepalive|epoll|swarm|rawhttp")
 	cmd.Flags().IntVar(&domainTimeoutMs, "domain-timeout", 30_000, "Per-domain context deadline in ms; cancel remaining URLs after this (0=disabled)")
 	cmd.Flags().IntVar(&domainFailThreshold, "domain-fail-threshold", -1, "Abandon domain after this many timeout rounds (×conns); -1=engine default (3)")
