@@ -10,7 +10,7 @@ REMOTE_SSH     = $(REMOTE_USER)@$(REMOTE_HOST)
 SSH           ?= ssh -i $(DEPLOY_KEY) -o BatchMode=yes
 SCP           ?= scp -i $(DEPLOY_KEY)
 
-BINARY        := crawler-linux
+BINARY        ?= crawler-linux-$(SERVER)
 IMAGE_NAME    := crawler-rust-builder
 
 .PHONY: build build-linux build-on-server deploy deploy-server1 deploy-server2 test remote-test remote-hn-recrawl remote-benchmark clean
