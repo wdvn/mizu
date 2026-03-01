@@ -808,6 +808,8 @@ func runHNRecrawlV3(ctx context.Context,
 	fmt.Printf("  Loaded %s seed URLs\n\n", labelStyle.Render(formatInt64Exact(int64(len(seeds)))))
 
 	// ── DNS pre-resolution ────────────────────────────────────────────────────
+	totalSeeds := int64(len(seeds)) // total before DNS filtering
+	var dnsDeadCount int64
 	var dnsCache crawl.DNSCache
 	dnsCachePath := filepath.Join(hnCfg.WithDefaults().RecrawlDir(), "dns.duckdb")
 	if dnsWorkers > 0 {
@@ -849,9 +851,10 @@ func runHNRecrawlV3(ctx context.Context,
 			}
 		}
 		seeds = filtered
-		if skippedDNS := before - len(seeds); skippedDNS > 0 {
+		dnsDeadCount = int64(before - len(seeds))
+		if dnsDeadCount > 0 {
 			fmt.Printf("  Filtered %s dead/timeout seeds → %s remaining\n\n",
-				labelStyle.Render(formatInt64Exact(int64(skippedDNS))),
+				labelStyle.Render(formatInt64Exact(dnsDeadCount)),
 				labelStyle.Render(formatInt64Exact(int64(len(seeds)))),
 			)
 		}
@@ -900,6 +903,8 @@ func runHNRecrawlV3(ctx context.Context,
 		DBShards:     dbShards,
 		DBMemMB:      dbMemMB,
 		SysInfo:      si,
+		TotalSeeds:   totalSeeds,
+		DNSDeadCount: dnsDeadCount,
 	})
 }
 

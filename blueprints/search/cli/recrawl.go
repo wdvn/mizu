@@ -31,6 +31,11 @@ type recrawlJobArgs struct {
 	DBShards     int
 	DBMemMB      int
 	SysInfo      crawl.SysInfo
+
+	// Coverage tracking: TotalSeeds is the count before any pre-filtering (0 = use len(Seeds)).
+	// DNSDeadCount is the number of seeds removed by DNS pre-resolution before the engine runs.
+	TotalSeeds   int64
+	DNSDeadCount int64
 }
 
 // runRecrawlJob is the shared two-pass recrawl runner used by both HN and CC pipelines.
@@ -219,46 +224,96 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 		)))
 	}
 
-	if args.FailedDBPath != "" {
-		printErrorBreakdown(args.FailedDBPath)
+	totalSeeds := args.TotalSeeds
+	if totalSeeds == 0 {
+		totalSeeds = int64(len(args.Seeds))
 	}
+	printFinalSummary(totalSeeds, args.DNSDeadCount, jobResult)
 
 	return err
 }
 
-// printErrorBreakdown prints a reason breakdown and top failing domains from the failed URL DB.
-// It prints even when queries partially fail (graceful degradation).
-func printErrorBreakdown(dbPath string) {
-	summary, total, err := store.FailedURLSummary(dbPath)
-	if err == nil && len(summary) > 0 {
-		fmt.Println("\nError breakdown (failed URLs):")
-		// Sort reasons by count descending
-		type kv struct {
-			reason string
-			count  int
+// printFinalSummary prints a comprehensive coverage summary using engine stats.
+//
+// Coverage identity (with pass-2):
+//
+//	TotalSeeds ≈ dnsDeadCount + pass1.OK + pass1.Failed + pass1.Timeout + pass1.Skipped
+//	           ≈ dnsDeadCount + ok + httpError + timeoutKilled
+//
+// When pass-2 runs: timeout/killed final = pass2.Timeout + pass2.Skipped (rescued ones don't appear here).
+// When pass-2 is nil: timeout/killed = pass1.Timeout + pass1.Skipped.
+// "other" is non-zero only when the engine itself dropped seeds (engine-level DNS filter);
+// this is expected to be zero when the caller pre-filters dead/timeout domains.
+func printFinalSummary(totalSeeds, dnsDeadCount int64, result *crawl.JobResult) {
+	if result == nil || result.Pass1 == nil {
+		return
+	}
+	p1 := result.Pass1
+	p2 := result.Pass2
+	hasRetry := p2 != nil
+
+	ok := p1.OK
+	var httpError, timeoutKilled int64
+	if hasRetry {
+		ok += p2.OK
+		httpError = p1.Failed + p2.Failed
+		timeoutKilled = p2.Timeout + p2.Skipped
+	} else {
+		httpError = p1.Failed
+		timeoutKilled = p1.Timeout + p1.Skipped
+	}
+
+	failed := totalSeeds - ok
+	computed := dnsDeadCount + ok + httpError + timeoutKilled
+	other := totalSeeds - computed // >0 only if engine dropped seeds outside stats
+
+	const border = "════════════════════════════════════════════════"
+	fmt.Println()
+	fmt.Println(border)
+	fmt.Println("            Crawl Final Summary")
+	fmt.Println(border)
+	fmt.Printf("\n  Total seeds:       %s\n", ccFmtInt64(totalSeeds))
+	fmt.Printf("  ✓ Succeeded:       %s  (%.1f%%)\n", ccFmtInt64(ok), v3SafePct(ok, totalSeeds))
+	if hasRetry {
+		fmt.Printf("      Pass 1:        %s\n", ccFmtInt64(p1.OK))
+		fmt.Printf("      Pass 2:        %s  (rescued)\n", ccFmtInt64(p2.OK))
+	}
+	fmt.Printf("  ✗ Failed:          %s  (%.1f%%)\n", ccFmtInt64(failed), v3SafePct(failed, totalSeeds))
+
+	if failed > 0 {
+		fmt.Println()
+		fmt.Println("  Error breakdown:")
+		if dnsDeadCount > 0 {
+			fmt.Printf("    %-42s %s  (%.1f%%)\n",
+				"dns_dead (filtered pre-crawl):", ccFmtInt64(dnsDeadCount), v3SafePct(dnsDeadCount, totalSeeds))
 		}
-		pairs := make([]kv, 0, len(summary))
-		for r, c := range summary {
-			pairs = append(pairs, kv{r, c})
-		}
-		sort.Slice(pairs, func(i, j int) bool { return pairs[i].count > pairs[j].count })
-		for _, p := range pairs {
-			pct := float64(0)
-			if total > 0 {
-				pct = float64(p.count) / float64(total) * 100
+		if httpError > 0 {
+			label := "http_error:"
+			if hasRetry {
+				label = "http_error (pass 1 + pass 2):"
 			}
-			fmt.Printf("  %-38s %s  (%5.1f%%)\n", p.reason, ccFmtInt64(int64(p.count)), pct)
+			fmt.Printf("    %-42s %s  (%.1f%%)\n", label, ccFmtInt64(httpError), v3SafePct(httpError, totalSeeds))
+		}
+		if timeoutKilled > 0 {
+			label := "timeout/killed (no retry):"
+			if hasRetry {
+				label = "timeout/killed (pass 2 exhausted):"
+			}
+			fmt.Printf("    %-42s %s  (%.1f%%)\n", label, ccFmtInt64(timeoutKilled), v3SafePct(timeoutKilled, totalSeeds))
+		}
+		if other > 0 {
+			fmt.Printf("    %-42s %s  (%.1f%%)\n", "other (engine-filtered):", ccFmtInt64(other), v3SafePct(other, totalSeeds))
 		}
 	}
 
-	top, err := store.FailedURLTopDomains(dbPath, 10)
-	if err == nil && len(top) > 0 {
-		fmt.Println("\nTop failing domains:")
-		for _, entry := range top {
-			fmt.Printf("  %-40s %s\n", entry[0], entry[1])
-		}
-		fmt.Printf("  (top %d)\n", len(top))
+	fmt.Println()
+	if other == 0 {
+		fmt.Printf("  Coverage: %s / %s (100.0%%) ✓\n", ccFmtInt64(totalSeeds), ccFmtInt64(totalSeeds))
+	} else {
+		fmt.Printf("  Coverage: %s / %s (%.1f%%)  ← gap: %s unaccounted\n",
+			ccFmtInt64(computed), ccFmtInt64(totalSeeds), v3SafePct(computed, totalSeeds), ccFmtInt64(other))
 	}
+	fmt.Println(border)
 }
 
 // ── Display types ──────────────────────────────────────────────────────────────

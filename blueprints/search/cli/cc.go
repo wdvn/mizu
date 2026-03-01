@@ -1406,6 +1406,7 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		DBShards:     dbShards,
 		DBMemMB:      dbMemMB,
 		SysInfo:      si,
+		TotalSeeds:   int64(len(seeds)),
 	})
 }
 
