@@ -1,4 +1,6 @@
 pub mod devnull;
+pub mod duckdb_writer;
+pub mod parquet_writer;
 
 use crate::types::{CrawlResult, FailedDomain, FailedURL};
 use anyhow::Result;
