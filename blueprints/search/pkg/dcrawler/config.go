@@ -78,10 +78,12 @@ func DefaultConfig() Config {
 // AutoBrowserPages returns the optimal number of concurrent browser tabs
 // based on available RAM. Formula: clamp(availRAMMB / 50, 20, 150).
 //
-// Benchmarks (openai.com, --no-render-wait):
+// Benchmarks (openai.com --no-render-wait --scroll 0, Cloudflare+Next.js):
 //
-//	server1 (~3500 MB avail) → 70 tabs → ~100 pages/s
-//	server2 (~9000 MB avail) → 150 tabs → ~150 pages/s
+//	server2 (~11 GB avail) → 150 tabs → ~6 pages/s (1012 pages / 173s)
+//
+// Note: openai.com is rate-limited by Cloudflare and heavy JS (~25s/page).
+// Lighter sites without anti-bot will achieve much higher throughput.
 func AutoBrowserPages(availRAMMB int) int {
 	n := availRAMMB / 50
 	if n < 20 {

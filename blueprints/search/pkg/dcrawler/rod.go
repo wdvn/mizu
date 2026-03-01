@@ -18,23 +18,31 @@ import (
 )
 
 // detectChromeBin returns the Chrome/Chromium binary path to use.
-// Priority: $CHROME_BIN env var → common Linux paths → rod auto-detect.
+// Priority: $CHROME_BIN env var → ~/bin/chromium (download-chrome) → system paths → rod auto-detect.
 func detectChromeBin() string {
 	if p := os.Getenv("CHROME_BIN"); p != "" {
 		return p
 	}
+	// Build candidate list: user-local install first, then system paths.
 	candidates := []string{
 		"/usr/bin/chromium",
 		"/usr/bin/chromium-browser",
 		"/usr/bin/google-chrome",
 		"/usr/bin/google-chrome-stable",
 	}
+	if home, err := os.UserHomeDir(); err == nil {
+		// Prepend user-local paths (from make download-chrome or manual install).
+		candidates = append([]string{
+			home + "/bin/chromium",
+			home + "/.local/bin/chromium",
+		}, candidates...)
+	}
 	for _, c := range candidates {
 		if _, err := os.Stat(c); err == nil {
 			return c
 		}
 	}
-	return "" // let rod auto-detect
+	return "" // let rod auto-detect via PATH
 }
 
 // newLauncher creates a rod launcher with Chrome path and server-safe flags.

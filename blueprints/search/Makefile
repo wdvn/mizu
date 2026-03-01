@@ -228,6 +228,22 @@ deploy-linux: build-linux ## Deploy linux binary to remote $$HOME/bin/search
 		chmod +x $$HOME/bin/search"'
 	@echo "Deployed: $(REMOTE_SSH):~/bin/search"
 
+.PHONY: deploy-linux-browser
+deploy-linux-browser: build-linux ## Deploy Ubuntu 20.04 binary with Chrome wrapper (bundled libstdc++, SERVER=1)
+	@test -f "$(DEPLOY_KEY)" || { echo "Deploy key not found: $(DEPLOY_KEY)"; exit 1; }
+	@test -f "$(LINUX_RUNTIME_LIBSTDCPP)" || { echo "Missing runtime lib: $(LINUX_RUNTIME_LIBSTDCPP)"; exit 1; }
+	@$(SSH) $(REMOTE_SSH) "mkdir -p \$$HOME/bin \$$HOME/bin/search-libs"
+	@$(SCP) "$(LINUX_BINARY)" $(REMOTE_SSH):.search-upload.tmp
+	@$(SCP) "$(LINUX_RUNTIME_LIBSTDCPP)" $(REMOTE_SSH):.libstdc++.so.6.tmp
+	@$(SSH) $(REMOTE_SSH) 'bash -lc "set -e; \
+		install -m 0755 $$HOME/.search-upload.tmp $$HOME/bin/search-linux; \
+		install -m 0644 $$HOME/.libstdc++.so.6.tmp $$HOME/bin/search-libs/libstdc++.so.6; \
+		rm -f $$HOME/.search-upload.tmp $$HOME/.libstdc++.so.6.tmp; \
+		printf '"'"'#!/usr/bin/env bash\nulimit -Hn 131072 2>/dev/null; ulimit -n 131072 2>/dev/null || ulimit -n 65536 2>/dev/null || true\nexport GOMEMLIMIT=2000000000\nexport GODEBUG=netdns=go\nexport LD_LIBRARY_PATH=\"$$HOME/bin/search-libs\$${LD_LIBRARY_PATH:+:$$LD_LIBRARY_PATH}\"\nif [ -d $$HOME/bin/chrome-libs ]; then export LD_LIBRARY_PATH=\"$$HOME/bin/chrome-libs:\$${LD_LIBRARY_PATH}\"; fi\nif [ -f /usr/bin/chromium ]; then export CHROME_BIN=/usr/bin/chromium; elif [ -f $$HOME/bin/chromium ]; then export CHROME_BIN=$$HOME/bin/chromium; fi\nexec \"$$HOME/bin/search-linux\" \"\$$@\"\n'"'"' > $$HOME/bin/search; \
+		chmod +x $$HOME/bin/search"'
+	@echo "Deployed Focal+Chrome: $(REMOTE_SSH):~/bin/search"
+	@echo "NOTE: Run 'make download-chrome SERVER=$(SERVER)' to install Chrome first"
+
 .PHONY: deploy-key-install
 deploy-key-install: ## Authorize DEPLOY_KEY on remote server (SERVER=2 for server2)
 	@test -f "$(DEPLOY_KEY).pub" || { echo "Deploy public key not found: $(DEPLOY_KEY).pub"; exit 1; }
