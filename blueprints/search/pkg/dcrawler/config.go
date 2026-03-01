@@ -12,64 +12,64 @@ import (
 
 // Config holds crawler configuration.
 type Config struct {
-	Domain           string
-	SeedURLs         []string
-	Workers          int
-	MaxConns         int
-	MaxIdleConns     int
-	Timeout          time.Duration
-	MaxDepth         int
-	MaxPages         int
-	MaxBodySize      int64
-	UserAgent        string
-	DataDir          string
-	ShardCount       int
-	BatchSize        int
-	StoreBody        bool
-	StoreLinks       bool
-	RespectRobots    bool
-	FollowSitemap    bool
-	Resume           bool
-	FrontierSize     int
-	BloomCapacity    uint
-	BloomFPR         float64
-	RateLimit        int
-	IncludeSubdomain bool
-	ForceHTTP1       bool
-	TransportShards  int
-	SeedFile         string
-	Continuous       bool          // Run non-stop, re-seed when frontier drains
-	ReseedInterval   time.Duration // Min interval between re-seeds (default 30s)
-	UseRod           bool          // Use headless Chrome via rod for JS-rendered pages
-	RodWorkers       int           // Number of browser pages (default 40)
-	RodHeadless      bool          // Run rod in headless mode (default true)
-	ScrollCount      int           // Browser mode: scroll N times for infinite scroll (0=no scroll)
-	ExtractImages    bool          // Extract <img> URLs and store in links table
-	RodBlockResources bool         // Block images/fonts/CSS in browser mode for faster loads
-	StaleHours        int          // Resume: re-crawl pages older than N hours (0=disabled)
-	UseLightpanda     bool         // Use Lightpanda browser via CDP (alternative to Chrome/rod)
-	DomainAliases     []string     // Additional domains to treat as same-domain (e.g., "new.qq.com" for "news.qq.com")
-	RodNoRenderWait   bool         // Skip DOM stabilization wait (faster for SSG/static Next.js sites)
-	UserDataDir string // Chrome user-data-dir for persistent cookies/localStorage across restarts
+	Domain            string
+	SeedURLs          []string
+	Workers           int
+	MaxConns          int
+	MaxIdleConns      int
+	Timeout           time.Duration
+	MaxDepth          int
+	MaxPages          int
+	MaxBodySize       int64
+	UserAgent         string
+	DataDir           string
+	ShardCount        int
+	BatchSize         int
+	StoreBody         bool
+	StoreLinks        bool
+	RespectRobots     bool
+	FollowSitemap     bool
+	Resume            bool
+	FrontierSize      int
+	BloomCapacity     uint
+	BloomFPR          float64
+	RateLimit         int
+	IncludeSubdomain  bool
+	ForceHTTP1        bool
+	TransportShards   int
+	SeedFile          string
+	Continuous        bool          // Run non-stop, re-seed when frontier drains
+	ReseedInterval    time.Duration // Min interval between re-seeds (default 30s)
+	UseRod            bool          // Use headless Chrome via rod for JS-rendered pages
+	RodWorkers        int           // Number of browser pages (default 40)
+	RodHeadless       bool          // Run rod in headless mode (default true)
+	ScrollCount       int           // Browser mode: scroll N times for infinite scroll (0=no scroll)
+	ExtractImages     bool          // Extract <img> URLs and store in links table
+	RodBlockResources bool          // Block images/fonts/CSS in browser mode for faster loads
+	StaleHours        int           // Resume: re-crawl pages older than N hours (0=disabled)
+	UseLightpanda     bool          // Use Lightpanda browser via CDP (alternative to Chrome/rod)
+	DomainAliases     []string      // Additional domains to treat as same-domain (e.g., "new.qq.com" for "news.qq.com")
+	RodNoRenderWait   bool          // Skip DOM stabilization wait (faster for SSG/static Next.js sites)
+	UserDataDir       string        // Chrome user-data-dir for persistent cookies/localStorage across restarts
 }
 
 // DefaultConfig returns optimal defaults for high-throughput single-domain crawling.
 // Targets 10K+ pages/sec via HTTP/2 multiplexing.
 func DefaultConfig() Config {
 	return Config{
-		Workers:       1000,
-		MaxConns:      200,           // ~200 TCP conns × ~250 H2 streams = 50K concurrent
-		MaxIdleConns:  500,
-		Timeout:       10 * time.Second,
-		MaxBodySize:   512 * 1024,    // 512KB
-		UserAgent:     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-		DataDir:       defaultDataDir(),
-		ShardCount:    8,
-		BatchSize:     500,
-		StoreLinks:    true,
-		RespectRobots: true,
-		FollowSitemap: true,
-		FrontierSize:  4_000_000,
+		Workers:         1000,
+		MaxConns:        200, // ~200 TCP conns × ~250 H2 streams = 50K concurrent
+		MaxIdleConns:    500,
+		Timeout:         10 * time.Second,
+		MaxBodySize:     512 * 1024, // 512KB
+		UserAgent:       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+		DataDir:         defaultDataDir(),
+		ShardCount:      8,
+		BatchSize:       500,
+		StoreLinks:      true,
+		RespectRobots:   true,
+		FollowSitemap:   true,
+		FrontierSize:    4_000_000,
 		BloomCapacity:   50_000_000,
 		BloomFPR:        0.001,
 		TransportShards: 16,
