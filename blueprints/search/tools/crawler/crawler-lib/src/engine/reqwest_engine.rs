@@ -321,14 +321,16 @@ async fn process_one_url(
             let error_str = error_chain_string(&reqwest_err);
 
             if category == ErrorCategory::Timeout {
-                let timeout_n = stats.timeout.fetch_add(1, Ordering::Relaxed) + 1;
+                stats.timeout.fetch_add(1, Ordering::Relaxed);
                 // Sub-classify: connect timeout (< cfg.timeout) vs response timeout (full timeout)
                 let timeout_threshold_ms = (cfg.timeout.as_millis() as i64) * 90 / 100;
-                if fetch_ms < timeout_threshold_ms {
+                let subcat = if fetch_ms < timeout_threshold_ms {
                     stats.timeout_connect.fetch_add(1, Ordering::Relaxed);
+                    "connect"
                 } else {
                     stats.timeout_response.fetch_add(1, Ordering::Relaxed);
-                }
+                    "response"
+                };
                 let t = domain_entry.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
                 let s = domain_entry.ok.load(Ordering::Relaxed);
 
@@ -356,6 +358,7 @@ async fn process_one_url(
                     url: seed.url.clone(),
                     domain: seed.domain.clone(),
                     reason: "http_timeout".to_string(),
+                    subcategory: subcat.to_string(),
                     error: error_str,
                     status_code: 0,
                     fetch_time_ms: fetch_ms,
@@ -363,66 +366,73 @@ async fn process_one_url(
                 });
             } else {
                 stats.failed.fetch_add(1, Ordering::Relaxed);
+                let lower = error_str.to_lowercase();
 
-                // Track error sub-category.
-                match category {
+                // Track error sub-category and compute subcategory string.
+                let subcat: &str = match category {
                     ErrorCategory::InvalidUrl => {
                         let n = stats.err_invalid_url.fetch_add(1, Ordering::Relaxed) + 1;
                         if n <= 5 || n % 200 == 0 {
                             stats.push_warning(format!("invalid: {} ({})", seed.domain, short_error(&error_str)));
                         }
+                        "invalid"
                     }
                     ErrorCategory::Dns => {
                         let n = stats.err_dns.fetch_add(1, Ordering::Relaxed) + 1;
-                        // Sub-classify DNS errors from error chain.
-                        let lower = error_str.to_lowercase();
-                        if lower.contains("no records found") || lower.contains("nxdomain")
+                        let sub = if lower.contains("no records found") || lower.contains("nxdomain")
                             || lower.contains("name or service not known")
                             || lower.contains("no address associated")
                         {
                             stats.dns_nxdomain.fetch_add(1, Ordering::Relaxed);
+                            "nxdomain"
                         } else if lower.contains("malformed") || lower.contains("invalid character")
                             || lower.contains("label bytes exceed")
                         {
                             stats.dns_malformed.fetch_add(1, Ordering::Relaxed);
+                            "malformed"
                         } else {
                             stats.dns_other.fetch_add(1, Ordering::Relaxed);
-                        }
+                            "other"
+                        };
                         if n <= 5 || (n <= 100 && n % 20 == 0) || n % 500 == 0 {
                             stats.push_warning(format!("dns: {} ({})", seed.domain, short_error(&error_str)));
                         }
+                        sub
                     }
                     ErrorCategory::Connection => {
                         let n = stats.err_conn.fetch_add(1, Ordering::Relaxed) + 1;
-                        // Sub-classify connection errors from error chain.
-                        let lower = error_str.to_lowercase();
-                        if lower.contains("connection refused") {
+                        let sub = if lower.contains("connection refused") {
                             stats.conn_refused.fetch_add(1, Ordering::Relaxed);
+                            "refused"
                         } else if lower.contains("reset by peer") || lower.contains("connection reset") {
                             stats.conn_reset.fetch_add(1, Ordering::Relaxed);
+                            "reset"
                         } else if lower.contains("unexpected eof") || lower.contains("connection closed")
                             || lower.contains("broken pipe")
                         {
                             stats.conn_eof.fetch_add(1, Ordering::Relaxed);
+                            "eof"
                         } else {
                             stats.conn_other.fetch_add(1, Ordering::Relaxed);
-                        }
+                            "other"
+                        };
                         if n <= 3 || n % 500 == 0 {
                             stats.push_warning(format!("conn: {} ({})", seed.domain, short_error(&error_str)));
                         }
+                        sub
                     }
                     ErrorCategory::Tls => {
                         let n = stats.err_tls.fetch_add(1, Ordering::Relaxed) + 1;
                         if n <= 3 || n % 200 == 0 {
                             stats.push_warning(format!("tls: {} ({})", seed.domain, short_error(&error_str)));
                         }
+                        "tls"
                     }
                     _ => {
                         let n = stats.err_other.fetch_add(1, Ordering::Relaxed) + 1;
                         if n <= 10 || n % 200 == 0 {
                             stats.push_warning(format!("other: {} ({})", seed.domain, short_error(&error_str)));
                         }
-                        // Always log "other" errors — they should be zero.
                         if n <= 50 {
                             tracing::warn!(n, domain = %seed.domain, fetch_ms, chain = %error_str,
                                 is_timeout = reqwest_err.is_timeout(), is_connect = reqwest_err.is_connect(),
@@ -430,8 +440,9 @@ async fn process_one_url(
                                 is_body = reqwest_err.is_body(), is_decode = reqwest_err.is_decode(),
                                 "other_sample");
                         }
+                        "other"
                     }
-                }
+                };
 
                 let _ = failures.write_url(FailedURL {
                     url: seed.url.clone(),
@@ -443,6 +454,7 @@ async fn process_one_url(
                         ErrorCategory::Tls => "tls_error",
                         _ => "http_error",
                     }.to_string(),
+                    subcategory: subcat.to_string(),
                     error: error_str,
                     status_code: 0,
                     fetch_time_ms: fetch_ms,
@@ -630,12 +642,39 @@ async fn fetch_one(
     // Sanitize URL: fix "http:// domain" → "http://domain", trim whitespace.
     let url = sanitize_url(&seed.url);
 
-    let response = client
+    let profile = ua::pick_profile(&seed.domain);
+    let mut req = client
         .get(&url)
-        .header("User-Agent", ua::pick_user_agent())
-        .timeout(timeout)
-        .send()
-        .await;
+        .header("User-Agent", profile.user_agent)
+        .header("Accept", profile.accept)
+        .header("Accept-Language", profile.accept_language)
+        .header("Accept-Encoding", profile.accept_encoding)
+        .header("Upgrade-Insecure-Requests", "1")
+        .timeout(timeout);
+
+    if let Some(v) = profile.sec_ch_ua {
+        req = req.header("Sec-CH-UA", v);
+    }
+    if let Some(v) = profile.sec_ch_ua_mobile {
+        req = req.header("Sec-CH-UA-Mobile", v);
+    }
+    if let Some(v) = profile.sec_ch_ua_platform {
+        req = req.header("Sec-CH-UA-Platform", v);
+    }
+    if let Some(v) = profile.sec_fetch_dest {
+        req = req.header("Sec-Fetch-Dest", v);
+    }
+    if let Some(v) = profile.sec_fetch_mode {
+        req = req.header("Sec-Fetch-Mode", v);
+    }
+    if let Some(v) = profile.sec_fetch_site {
+        req = req.header("Sec-Fetch-Site", v);
+    }
+    if let Some(v) = profile.sec_fetch_user {
+        req = req.header("Sec-Fetch-User", v);
+    }
+
+    let response = req.send().await;
 
     let resp = match response {
         Ok(r) => r,

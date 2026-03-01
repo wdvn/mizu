@@ -316,6 +316,7 @@ async fn process_one_url(
                 url: seed.url.clone(),
                 domain: seed.domain.clone(),
                 reason: "http_timeout".to_string(),
+                subcategory: "response".to_string(),
                 error: result.error.clone(),
                 status_code: 0,
                 fetch_time_ms: result.fetch_time_ms,
@@ -327,6 +328,7 @@ async fn process_one_url(
                 url: seed.url.clone(),
                 domain: seed.domain.clone(),
                 reason: "http_error".to_string(),
+                subcategory: String::new(),
                 error: result.error.clone(),
                 status_code: result.status_code,
                 fetch_time_ms: result.fetch_time_ms,
@@ -368,11 +370,37 @@ async fn hyper_fetch_one(
             }
         };
 
-        let req = match hyper::Request::builder()
+        let profile = ua::pick_profile(&seed.domain);
+        let mut builder = hyper::Request::builder()
             .method(hyper::Method::GET)
             .uri(&uri)
-            .header("user-agent", ua::pick_user_agent())
-            .body(Empty::<Bytes>::new())
+            .header("user-agent", profile.user_agent)
+            .header("accept", profile.accept)
+            .header("accept-language", profile.accept_language)
+            .header("accept-encoding", profile.accept_encoding)
+            .header("upgrade-insecure-requests", "1");
+        if let Some(v) = profile.sec_ch_ua {
+            builder = builder.header("sec-ch-ua", v);
+        }
+        if let Some(v) = profile.sec_ch_ua_mobile {
+            builder = builder.header("sec-ch-ua-mobile", v);
+        }
+        if let Some(v) = profile.sec_ch_ua_platform {
+            builder = builder.header("sec-ch-ua-platform", v);
+        }
+        if let Some(v) = profile.sec_fetch_dest {
+            builder = builder.header("sec-fetch-dest", v);
+        }
+        if let Some(v) = profile.sec_fetch_mode {
+            builder = builder.header("sec-fetch-mode", v);
+        }
+        if let Some(v) = profile.sec_fetch_site {
+            builder = builder.header("sec-fetch-site", v);
+        }
+        if let Some(v) = profile.sec_fetch_user {
+            builder = builder.header("sec-fetch-user", v);
+        }
+        let req = match builder.body(Empty::<Bytes>::new())
         {
             Ok(r) => r,
             Err(e) => {
