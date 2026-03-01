@@ -232,6 +232,7 @@ fn render(frame: &mut ratatui::Frame, stats: &Stats, cfg: &TuiConfig, state: &Re
     let pass = stats.pass.load(Ordering::Relaxed);
 
     // Error breakdown
+    let err_inv = stats.err_invalid_url.load(Ordering::Relaxed);
     let err_dns = stats.err_dns.load(Ordering::Relaxed);
     let err_conn = stats.err_conn.load(Ordering::Relaxed);
     let err_tls = stats.err_tls.load(Ordering::Relaxed);
@@ -319,7 +320,7 @@ fn render(frame: &mut ratatui::Frame, stats: &Stats, cfg: &TuiConfig, state: &Re
     render_main(
         frame, main_area,
         ok, failed, timeout, skipped, total,
-        err_dns, err_conn, err_tls, err_other,
+        err_inv, err_dns, err_conn, err_tls, err_other,
         avg_rps, peak_rps, elapsed, eta,
         s2xx, s3xx, s4xx, s5xx,
         dom_total, dom_abandoned,
@@ -339,7 +340,7 @@ fn render_main(
     frame: &mut ratatui::Frame,
     area: Rect,
     ok: u64, failed: u64, timeout: u64, skipped: u64, total: u64,
-    err_dns: u64, err_conn: u64, err_tls: u64, err_other: u64,
+    err_inv: u64, err_dns: u64, err_conn: u64, err_tls: u64, err_other: u64,
     avg_rps: f64, peak_rps: u64, elapsed: Duration, eta: Option<Duration>,
     s2xx: u64, s3xx: u64, s4xx: u64, s5xx: u64,
     dom_total: u64, dom_abandoned: u64,
@@ -351,7 +352,7 @@ fn render_main(
         Constraint::Min(24),
     ]).areas(area);
 
-    render_counters(frame, left, ok, failed, timeout, skipped, total, err_dns, err_conn, err_tls, err_other);
+    render_counters(frame, left, ok, failed, timeout, skipped, total, err_inv, err_dns, err_conn, err_tls, err_other);
     render_throughput(
         frame, right, avg_rps, peak_rps, elapsed, eta,
         s2xx, s3xx, s4xx, s5xx,
@@ -365,7 +366,7 @@ fn render_counters(
     frame: &mut ratatui::Frame,
     area: Rect,
     ok: u64, failed: u64, timeout: u64, skipped: u64, total: u64,
-    err_dns: u64, err_conn: u64, err_tls: u64, err_other: u64,
+    err_inv: u64, err_dns: u64, err_conn: u64, err_tls: u64, err_other: u64,
 ) {
     let dim = Style::default().fg(Color::DarkGray);
     let bold = Style::default().add_modifier(Modifier::BOLD);
@@ -379,16 +380,21 @@ fn render_counters(
     // Error breakdown (sub-lines under Failed, only when there are failures)
     if failed > 0 {
         lines.push(Line::from(vec![
-            Span::styled("   dns ", Style::default().fg(Color::Rgb(255, 100, 100))),
-            Span::styled(format!("{:>7}", fmt_count(err_dns)), dim),
-            Span::styled("  conn ", Style::default().fg(Color::Rgb(255, 140, 100))),
-            Span::styled(format!("{}", fmt_count(err_conn)), dim),
+            Span::styled("   inv ", Style::default().fg(Color::Rgb(180, 180, 180))),
+            Span::styled(format!("{:>6}", fmt_count(err_inv)), dim),
+            Span::styled(" dns ", Style::default().fg(Color::Rgb(255, 100, 100))),
+            Span::styled(format!("{}", fmt_count(err_dns)), dim),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("   tls ", Style::default().fg(Color::Rgb(255, 180, 100))),
-            Span::styled(format!("{:>7}", fmt_count(err_tls)), dim),
-            Span::styled("  other", Style::default().fg(Color::Rgb(200, 200, 200))),
-            Span::styled(format!("{:>5}", fmt_count(err_other)), dim),
+            Span::styled("   conn", Style::default().fg(Color::Rgb(255, 140, 100))),
+            Span::styled(format!("{:>6}", fmt_count(err_conn)), dim),
+            Span::styled(" tls ", Style::default().fg(Color::Rgb(255, 180, 100))),
+            Span::styled(format!("{}", fmt_count(err_tls)), dim),
+            if err_other > 0 {
+                Span::styled(format!(" ?{}", fmt_count(err_other)), Style::default().fg(Color::Rgb(120, 120, 120)))
+            } else {
+                Span::raw("")
+            },
         ]));
     } else {
         lines.push(Line::from(Span::raw("")));

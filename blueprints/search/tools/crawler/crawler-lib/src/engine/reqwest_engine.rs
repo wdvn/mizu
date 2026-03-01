@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::domain::{group_by_domain, DomainState};
-use crate::stats::{classify_error, AdaptiveTimeout, ErrorCategory, Stats, StatsSnapshot};
+use crate::stats::{AdaptiveTimeout, ErrorCategory, Stats, StatsSnapshot};
 use crate::types::{CrawlResult, FailedURL, SeedURL};
 use crate::ua;
 use crate::writer::{FailureWriter, ResultWriter};
@@ -251,9 +251,10 @@ impl super::Engine for ReqwestEngine {
 
         // Push final summary event.
         stats.push_warning(format!(
-            "done: {} ok, {} failed (dns={} conn={} tls={}), {} timeout, {:.0} avg rps",
+            "done: {} ok, {} failed (inv={} dns={} conn={} tls={}), {} timeout, {:.0} avg rps",
             snapshot.ok,
             snapshot.failed,
+            snapshot.err_invalid_url,
             snapshot.err_dns,
             snapshot.err_conn,
             snapshot.err_tls,
@@ -310,118 +311,123 @@ async fn process_one_url(
     };
 
     // Fetch the URL.
-    let result = fetch_one(client, &seed, effective_timeout, cfg.max_body_bytes).await;
+    let fetch_result = fetch_one(client, &seed, effective_timeout, cfg.max_body_bytes).await;
     stats.total.fetch_add(1, Ordering::Relaxed);
 
-    // Classify result and update domain state.
-    if !result.error.is_empty() {
-        let category = classify_error(&result.error);
+    match fetch_result {
+        Err((reqwest_err, fetch_ms)) => {
+            // Classify using reqwest's typed error methods + full error chain.
+            let category = classify_reqwest_error(&reqwest_err);
+            let error_str = error_chain_string(&reqwest_err);
 
-        if category == ErrorCategory::Timeout {
-            stats.timeout.fetch_add(1, Ordering::Relaxed);
-            let t = domain_entry.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
-            let s = domain_entry.ok.load(Ordering::Relaxed);
+            if category == ErrorCategory::Timeout {
+                stats.timeout.fetch_add(1, Ordering::Relaxed);
+                let t = domain_entry.timeouts.fetch_add(1, Ordering::Relaxed) + 1;
+                let s = domain_entry.ok.load(Ordering::Relaxed);
 
-            let ds = DomainState { successes: s, timeouts: t };
-            if ds.should_abandon(
-                cfg.domain_fail_threshold,
-                cfg.domain_dead_probe,
-                cfg.domain_stall_ratio,
-                inner_n,
-            ) {
-                // Only emit warning on the first abandonment (swap returns old value).
-                if !domain_entry.abandoned.swap(true, Ordering::Relaxed) {
-                    debug!(
-                        "abandoning domain {} (timeouts={}, ok={})",
-                        seed.domain, t, s
-                    );
-                    stats.domains_abandoned.fetch_add(1, Ordering::Relaxed);
-                    stats.push_warning(format!(
-                        "abandoned {} (timeouts={}, ok={})",
-                        seed.domain, t, s
-                    ));
+                let ds = DomainState { successes: s, timeouts: t };
+                if ds.should_abandon(
+                    cfg.domain_fail_threshold,
+                    cfg.domain_dead_probe,
+                    cfg.domain_stall_ratio,
+                    inner_n,
+                ) {
+                    if !domain_entry.abandoned.swap(true, Ordering::Relaxed) {
+                        debug!(
+                            "abandoning domain {} (timeouts={}, ok={})",
+                            seed.domain, t, s
+                        );
+                        stats.domains_abandoned.fetch_add(1, Ordering::Relaxed);
+                        stats.push_warning(format!(
+                            "abandoned {} (timeouts={}, ok={})",
+                            seed.domain, t, s
+                        ));
+                    }
                 }
+
+                let _ = failures.write_url(FailedURL {
+                    url: seed.url.clone(),
+                    domain: seed.domain.clone(),
+                    reason: "http_timeout".to_string(),
+                    error: error_str,
+                    status_code: 0,
+                    fetch_time_ms: fetch_ms,
+                    detected_at: chrono::Utc::now().naive_utc(),
+                });
+            } else {
+                stats.failed.fetch_add(1, Ordering::Relaxed);
+
+                // Track error sub-category.
+                match category {
+                    ErrorCategory::InvalidUrl => {
+                        let n = stats.err_invalid_url.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 5 || n % 200 == 0 {
+                            stats.push_warning(format!("invalid: {} ({})", seed.domain, short_error(&error_str)));
+                        }
+                    }
+                    ErrorCategory::Dns => {
+                        let n = stats.err_dns.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 5 || (n <= 100 && n % 20 == 0) || n % 500 == 0 {
+                            stats.push_warning(format!("dns: {} ({})", seed.domain, short_error(&error_str)));
+                        }
+                    }
+                    ErrorCategory::Connection => {
+                        let n = stats.err_conn.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 3 || n % 500 == 0 {
+                            stats.push_warning(format!("conn: {} ({})", seed.domain, short_error(&error_str)));
+                        }
+                    }
+                    ErrorCategory::Tls => {
+                        let n = stats.err_tls.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 3 || n % 200 == 0 {
+                            stats.push_warning(format!("tls: {} ({})", seed.domain, short_error(&error_str)));
+                        }
+                    }
+                    _ => {
+                        let n = stats.err_other.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n <= 10 || n % 200 == 0 {
+                            stats.push_warning(format!("other: {} ({})", seed.domain, short_error(&error_str)));
+                        }
+                    }
+                }
+
+                let _ = failures.write_url(FailedURL {
+                    url: seed.url.clone(),
+                    domain: seed.domain.clone(),
+                    reason: match category {
+                        ErrorCategory::InvalidUrl => "invalid_url",
+                        ErrorCategory::Dns => "dns_error",
+                        ErrorCategory::Connection => "conn_error",
+                        ErrorCategory::Tls => "tls_error",
+                        _ => "http_error",
+                    }.to_string(),
+                    error: error_str,
+                    status_code: 0,
+                    fetch_time_ms: fetch_ms,
+                    detected_at: chrono::Utc::now().naive_utc(),
+                });
             }
-
-            let _ = failures.write_url(FailedURL {
-                url: seed.url.clone(),
-                domain: seed.domain.clone(),
-                reason: "http_timeout".to_string(),
-                error: result.error.clone(),
-                status_code: 0,
-                fetch_time_ms: result.fetch_time_ms,
-                detected_at: chrono::Utc::now().naive_utc(),
-            });
-        } else {
-            stats.failed.fetch_add(1, Ordering::Relaxed);
-
-            // Track error sub-category.
-            match category {
-                ErrorCategory::Dns => {
-                    let n = stats.err_dns.fetch_add(1, Ordering::Relaxed) + 1;
-                    // Log first few DNS failures as events.
-                    if n <= 5 || (n <= 100 && n % 20 == 0) || n % 500 == 0 {
-                        stats.push_warning(format!("dns: {} ({})", seed.domain, short_error(&result.error)));
-                    }
-                }
-                ErrorCategory::Connection => {
-                    let n = stats.err_conn.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 3 || n % 500 == 0 {
-                        stats.push_warning(format!("conn: {} ({})", seed.domain, short_error(&result.error)));
-                    }
-                    // Sample first 50 conn errors with full detail for debugging.
-                    if n <= 50 {
-                        tracing::warn!(n, domain = %seed.domain, error = %result.error, fetch_ms = result.fetch_time_ms, "conn_sample");
-                    }
-                }
-                ErrorCategory::Tls => {
-                    let n = stats.err_tls.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 3 || n % 200 == 0 {
-                        stats.push_warning(format!("tls: {} ({})", seed.domain, short_error(&result.error)));
-                    }
-                }
-                _ => {
-                    let n = stats.err_other.fetch_add(1, Ordering::Relaxed) + 1;
-                    if n <= 5 || n % 500 == 0 {
-                        stats.push_warning(format!("error: {} ({})", seed.domain, short_error(&result.error)));
-                    }
-                }
-            }
-
-            let _ = failures.write_url(FailedURL {
-                url: seed.url.clone(),
-                domain: seed.domain.clone(),
-                reason: match category {
-                    ErrorCategory::Dns => "dns_error",
-                    ErrorCategory::Connection => "conn_error",
-                    ErrorCategory::Tls => "tls_error",
-                    _ => "http_error",
-                }.to_string(),
-                error: result.error.clone(),
-                status_code: result.status_code,
-                fetch_time_ms: result.fetch_time_ms,
-                detected_at: chrono::Utc::now().naive_utc(),
-            });
         }
-    } else {
-        stats.ok.fetch_add(1, Ordering::Relaxed);
-        domain_entry.ok.fetch_add(1, Ordering::Relaxed);
-        adaptive.record(result.fetch_time_ms);
+        Ok(result) => {
+            stats.ok.fetch_add(1, Ordering::Relaxed);
+            domain_entry.ok.fetch_add(1, Ordering::Relaxed);
+            adaptive.record(result.fetch_time_ms);
 
-        // Track HTTP status code distribution.
-        match result.status_code {
-            200..=299 => { stats.status_2xx.fetch_add(1, Ordering::Relaxed); }
-            300..=399 => { stats.status_3xx.fetch_add(1, Ordering::Relaxed); }
-            400..=499 => { stats.status_4xx.fetch_add(1, Ordering::Relaxed); }
-            500..=599 => { stats.status_5xx.fetch_add(1, Ordering::Relaxed); }
-            _ => {}
+            // Track HTTP status code distribution.
+            match result.status_code {
+                200..=299 => { stats.status_2xx.fetch_add(1, Ordering::Relaxed); }
+                300..=399 => { stats.status_3xx.fetch_add(1, Ordering::Relaxed); }
+                400..=499 => { stats.status_4xx.fetch_add(1, Ordering::Relaxed); }
+                500..=599 => { stats.status_5xx.fetch_add(1, Ordering::Relaxed); }
+                _ => {}
+            }
+
+            stats
+                .bytes_downloaded
+                .fetch_add(result.content_length as u64, Ordering::Relaxed);
+            let _ = results.write(result);
         }
     }
-
-    stats
-        .bytes_downloaded
-        .fetch_add(result.content_length as u64, Ordering::Relaxed);
-    let _ = results.write(result);
 }
 
 /// Sanitize a URL for reqwest:
@@ -508,16 +514,75 @@ fn short_error(error: &str) -> String {
     }
 }
 
+/// Classify a reqwest::Error using its typed methods (not string matching).
+/// This is reliable because reqwest sets internal flags for each error kind.
+fn classify_reqwest_error(e: &reqwest::Error) -> ErrorCategory {
+    if e.is_timeout() {
+        ErrorCategory::Timeout
+    } else if e.is_builder() {
+        ErrorCategory::InvalidUrl
+    } else if e.is_connect() {
+        // Connection includes TCP errors, but the inner source might reveal DNS/TLS.
+        // Walk the error chain to check for DNS or TLS errors inside a connect error.
+        let chain = error_chain_string(e);
+        let lower = chain.to_lowercase();
+        if lower.contains("dns") || lower.contains("resolve") || lower.contains("no record found")
+            || lower.contains("nxdomain") || lower.contains("name or service not known")
+            || lower.contains("failed to lookup")
+        {
+            ErrorCategory::Dns
+        } else if lower.contains("tls") || lower.contains("ssl") || lower.contains("certificate")
+            || lower.contains("handshake alert")
+        {
+            ErrorCategory::Tls
+        } else {
+            ErrorCategory::Connection
+        }
+    } else if e.is_request() {
+        // "error sending request" — walk chain to find the real cause.
+        let chain = error_chain_string(e);
+        let lower = chain.to_lowercase();
+        if lower.contains("dns") || lower.contains("resolve") || lower.contains("nxdomain")
+            || lower.contains("no record found") || lower.contains("failed to lookup")
+        {
+            ErrorCategory::Dns
+        } else if lower.contains("tls") || lower.contains("ssl") || lower.contains("certificate") {
+            ErrorCategory::Tls
+        } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("deadline") {
+            ErrorCategory::Timeout
+        } else {
+            ErrorCategory::Connection
+        }
+    } else if e.is_redirect() {
+        ErrorCategory::Connection
+    } else {
+        // Body, decode, or other errors
+        ErrorCategory::Other
+    }
+}
+
+/// Walk the std::error::Error source() chain, building a full error message.
+/// e.g. "error sending request: connection error: tcp connect error: Connection refused"
+fn error_chain_string(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut current: &dyn std::error::Error = e;
+    while let Some(source) = current.source() {
+        parts.push(source.to_string());
+        current = source;
+    }
+    parts.join(": ")
+}
+
 /// Fetch a single URL using the shared reqwest client.
 ///
-/// Returns a CrawlResult with metadata extracted from HTML responses.
-/// On error, returns an error result with the error message.
+/// Returns Ok(CrawlResult) on success (any HTTP status), Err on network/parse failure.
+/// The caller uses the reqwest::Error for proper classification.
 async fn fetch_one(
     client: &reqwest::Client,
     seed: &SeedURL,
     timeout: Duration,
     max_body_bytes: usize,
-) -> CrawlResult {
+) -> Result<CrawlResult, (reqwest::Error, i64)> {
     let start = Instant::now();
 
     // Sanitize URL: fix "http:// domain" → "http://domain", trim whitespace.
@@ -533,12 +598,8 @@ async fn fetch_one(
     let resp = match response {
         Ok(r) => r,
         Err(e) => {
-            return CrawlResult::error_result(
-                &seed.url,
-                &seed.domain,
-                e.to_string(),
-                start.elapsed().as_millis() as i64,
-            );
+            let elapsed = start.elapsed().as_millis() as i64;
+            return Err((e, elapsed));
         }
     };
 
@@ -568,12 +629,8 @@ async fn fetch_one(
         match read_body_limited(resp, max_body_bytes).await {
             Ok(b) => b,
             Err(e) => {
-                return CrawlResult::error_result(
-                    &seed.url,
-                    &seed.domain,
-                    e.to_string(),
-                    start.elapsed().as_millis() as i64,
-                );
+                let elapsed = start.elapsed().as_millis() as i64;
+                return Err((e, elapsed));
             }
         }
     } else {
@@ -590,7 +647,7 @@ async fn fetch_one(
         (String::new(), String::new(), String::new())
     };
 
-    CrawlResult {
+    Ok(CrawlResult {
         url: seed.url.clone(),
         domain: seed.domain.clone(),
         status_code: status,
@@ -604,7 +661,7 @@ async fn fetch_one(
         crawled_at: chrono::Utc::now().naive_utc(),
         error: String::new(),
         body: String::new(), // always empty — avoids DuckDB overflow blocks
-    }
+    })
 }
 
 /// Read response body up to `max_bytes`, stopping the download early.

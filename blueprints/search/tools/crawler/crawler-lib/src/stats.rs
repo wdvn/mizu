@@ -24,6 +24,7 @@ pub struct Stats {
     pub pass2_seeds: AtomicU64,
 
     // --- Error breakdown (sub-categories of `failed`) ---
+    pub err_invalid_url: AtomicU64, // garbage/unparseable URLs (builder error)
     pub err_dns: AtomicU64,
     pub err_conn: AtomicU64,
     pub err_tls: AtomicU64,
@@ -70,6 +71,7 @@ impl Stats {
             done: AtomicBool::new(false),
             pass: AtomicU8::new(1),
             pass2_seeds: AtomicU64::new(0),
+            err_invalid_url: AtomicU64::new(0),
             err_dns: AtomicU64::new(0),
             err_conn: AtomicU64::new(0),
             err_tls: AtomicU64::new(0),
@@ -110,6 +112,7 @@ impl Stats {
             total: self.total.load(Ordering::Relaxed),
             duration: self.start.elapsed(),
             peak_rps: self.peak_rps.load(Ordering::Relaxed),
+            err_invalid_url: self.err_invalid_url.load(Ordering::Relaxed),
             err_dns: self.err_dns.load(Ordering::Relaxed),
             err_conn: self.err_conn.load(Ordering::Relaxed),
             err_tls: self.err_tls.load(Ordering::Relaxed),
@@ -126,6 +129,7 @@ impl Stats {
 /// Error category for classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorCategory {
+    InvalidUrl,
     Dns,
     Connection,
     Tls,
@@ -203,6 +207,7 @@ pub struct StatsSnapshot {
     pub total: u64,
     pub duration: Duration,
     pub peak_rps: u64,
+    pub err_invalid_url: u64,
     pub err_dns: u64,
     pub err_conn: u64,
     pub err_tls: u64,
@@ -220,7 +225,7 @@ impl StatsSnapshot {
             ok: 0, failed: 0, timeout: 0, skipped: 0,
             bytes_downloaded: 0, total: 0,
             duration: Duration::ZERO, peak_rps: 0,
-            err_dns: 0, err_conn: 0, err_tls: 0, err_http_status: 0, err_other: 0,
+            err_invalid_url: 0, err_dns: 0, err_conn: 0, err_tls: 0, err_http_status: 0, err_other: 0,
             status_2xx: 0, status_3xx: 0, status_4xx: 0, status_5xx: 0,
         }
     }
@@ -244,6 +249,7 @@ impl StatsSnapshot {
             total: a.total + b.total,
             duration: a.duration + b.duration,
             peak_rps: a.peak_rps.max(b.peak_rps),
+            err_invalid_url: a.err_invalid_url + b.err_invalid_url,
             err_dns: a.err_dns + b.err_dns,
             err_conn: a.err_conn + b.err_conn,
             err_tls: a.err_tls + b.err_tls,
