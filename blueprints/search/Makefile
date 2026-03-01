@@ -172,6 +172,25 @@ deploy-linux-noble: build-linux-noble ## Deploy Ubuntu 24.04 binary to remote $$
 		chmod +x $$HOME/bin/search"'
 	@echo "Deployed Noble: $(REMOTE_SSH):~/bin/search"
 
+.PHONY: install-chrome
+install-chrome: ## One-time: install Chromium on remote server (SERVER=1 or 2)
+	@echo "Installing Chromium on $(REMOTE_SSH)..."
+	@$(SSH) $(REMOTE_SSH) "bash -lc 'apt-get update -qq && apt-get install -y --no-install-recommends chromium chromium-common fonts-liberation && which chromium && chromium --version'"
+	@echo "Chromium installed on $(REMOTE_SSH)"
+
+.PHONY: deploy-linux-noble-browser
+deploy-linux-noble-browser: build-linux-noble ## Deploy Ubuntu 24.04 binary with Chrome wrapper (run install-chrome SERVER=N first)
+	@test -f "$(DEPLOY_KEY)" || { echo "Deploy key not found: $(DEPLOY_KEY)"; exit 1; }
+	@$(SSH) $(REMOTE_SSH) "mkdir -p \$$HOME/bin"
+	@$(SCP) "$(LINUX_BINARY_NOBLE)" $(REMOTE_SSH):.search-upload.tmp
+	@$(SSH) $(REMOTE_SSH) 'bash -lc "set -e; \
+		install -m 0755 $$HOME/.search-upload.tmp $$HOME/bin/search-linux-noble; \
+		rm -f $$HOME/.search-upload.tmp; \
+		printf '"'"'#!/usr/bin/env bash\nulimit -Hn 131072 2>/dev/null; ulimit -n 131072 2>/dev/null || ulimit -n 65536 2>/dev/null || true\nexport GOMEMLIMIT=2000000000\nexport GODEBUG=netdns=go\nexport CHROME_BIN=/usr/bin/chromium\nexec \"$$HOME/bin/search-linux-noble\" \"\$$@\"\n'"'"' > $$HOME/bin/search; \
+		chmod +x $$HOME/bin/search"'
+	@echo "Deployed Noble+Chrome: $(REMOTE_SSH):~/bin/search"
+	@echo "NOTE: Run 'make install-chrome SERVER=$(SERVER)' first if Chromium is not installed"
+
 .PHONY: deploy-linux
 deploy-linux: build-linux ## Deploy linux binary to remote $$HOME/bin/search
 	@test -f "$(DEPLOY_KEY)" || { echo "Deploy key not found: $(DEPLOY_KEY)"; exit 1; }
