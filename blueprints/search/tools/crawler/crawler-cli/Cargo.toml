@@ -7,6 +7,10 @@ edition = "2024"
 name = "crawler"
 path = "src/main.rs"
 
+[features]
+default = ["wreq-engine"]
+wreq-engine = ["crawler-lib/wreq-engine"]
+
 [dependencies]
 crawler-lib = { path = "../crawler-lib" }
 clap = { version = "4", features = ["derive"] }

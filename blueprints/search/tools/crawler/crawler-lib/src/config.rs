@@ -6,6 +6,8 @@ use std::time::Duration;
 pub enum EngineType {
     Reqwest,
     Hyper,
+    #[cfg(feature = "wreq-engine")]
+    Wreq,
 }
 
 impl std::fmt::Display for EngineType {
@@ -13,6 +15,8 @@ impl std::fmt::Display for EngineType {
         match self {
             EngineType::Reqwest => write!(f, "reqwest"),
             EngineType::Hyper => write!(f, "hyper"),
+            #[cfg(feature = "wreq-engine")]
+            EngineType::Wreq => write!(f, "wreq"),
         }
     }
 }
@@ -23,6 +27,8 @@ impl std::str::FromStr for EngineType {
         match s.to_lowercase().as_str() {
             "reqwest" => Ok(EngineType::Reqwest),
             "hyper" => Ok(EngineType::Hyper),
+            #[cfg(feature = "wreq-engine")]
+            "wreq" => Ok(EngineType::Wreq),
             _ => Err(format!("unknown engine: {}", s)),
         }
     }

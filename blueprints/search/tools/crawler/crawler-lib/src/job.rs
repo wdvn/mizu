@@ -1,6 +1,8 @@
 use crate::config::{auto_config, Config, EngineType, SysInfo};
 use crate::engine::hyper_engine::HyperEngine;
 use crate::engine::reqwest_engine::ReqwestEngine;
+#[cfg(feature = "wreq-engine")]
+use crate::engine::wreq_engine::WreqEngine;
 use crate::engine::Engine;
 use crate::stats::StatsSnapshot;
 use crate::types::SeedURL;
@@ -81,6 +83,8 @@ pub async fn run_job(
     let engine: Box<dyn Engine> = match cfg.engine {
         EngineType::Reqwest => Box::new(ReqwestEngine::new()),
         EngineType::Hyper => Box::new(HyperEngine::new()),
+        #[cfg(feature = "wreq-engine")]
+        EngineType::Wreq => Box::new(WreqEngine::new()),
     };
 
     // --- Pass 1 ---

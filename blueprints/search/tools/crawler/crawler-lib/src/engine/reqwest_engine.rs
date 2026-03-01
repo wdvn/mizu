@@ -488,7 +488,7 @@ async fn process_one_url(
 /// - Trim whitespace
 /// - Fix "http:// domain" → "http://domain" (space after scheme)
 /// - Fix double schemes "http:// http://..." → "http://..."
-fn sanitize_url(url: &str) -> String {
+pub(crate) fn sanitize_url(url: &str) -> String {
     let url = url.trim();
 
     // Fix "http:// http://..." or "http:// https://..." (double scheme with space)
@@ -511,7 +511,7 @@ fn sanitize_url(url: &str) -> String {
 }
 
 /// Background system monitor: updates RSS, FDs, network stats every 500ms.
-async fn spawn_sysmon(stats: Arc<Stats>) {
+pub(crate) async fn spawn_sysmon(stats: Arc<Stats>) {
     let pid = sysinfo::Pid::from_u32(std::process::id());
     let mut sys = sysinfo::System::new();
     let mut nets = sysinfo::Networks::new_with_refreshed_list();

@@ -1,5 +1,7 @@
 pub mod hyper_engine;
 pub mod reqwest_engine;
+#[cfg(feature = "wreq-engine")]
+pub mod wreq_engine;
 
 use crate::config::Config;
 use crate::stats::StatsSnapshot;
