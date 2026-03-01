@@ -174,6 +174,7 @@ func cookiesToParams(cookies []*proto.NetworkCookie) []*proto.NetworkCookieParam
 				Secure:   c.Secure,
 				HTTPOnly: c.HTTPOnly,
 				SameSite: c.SameSite,
+				Expires:  c.Expires,
 			})
 		}
 	}
@@ -316,11 +317,21 @@ func (rp *rodPool) solveChallengeUnblocked(ctx context.Context, pageURL string) 
 		}
 	}
 
+	if solveCtx.Err() != nil {
+		return nil, fmt.Errorf("challenge timed out (still showing 'Just a moment...')")
+	}
+
 	cookies, err := p.Cookies([]string{pageURL})
 	if err != nil {
 		return nil, fmt.Errorf("challenge cookies: %w", err)
 	}
-	return cookies, nil
+	// Verify cf_clearance is present — partial cookies (e.g., only __cf_bm) won't bypass CF.
+	for _, c := range cookies {
+		if c.Name == "cf_clearance" {
+			return cookies, nil
+		}
+	}
+	return nil, fmt.Errorf("challenge solved but cf_clearance not found in cookies")
 }
 
 // injectJarCookies injects stored domain cookies into the page before navigation.
@@ -510,10 +521,12 @@ func (c *Crawler) rodFetchAndProcess(ctx context.Context, rp *rodPool, item Craw
 				browserDead = true
 			}
 		} else {
-			rp.putPage(page) // page is healthy, recycle it
+			close(pageClosed)    // stop watchdog before returning page to pool
+			rp.putPage(page)     // page is healthy, recycle it
 			browserDead = false
+			return
 		}
-		close(pageClosed) // signal watchdog to stop
+		close(pageClosed) // signal watchdog to stop (error path: page not recycled)
 	}()
 
 	// Inject XHR/fetch interceptor to capture URLs from API responses (news feeds, AJAX pagination).
