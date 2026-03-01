@@ -108,14 +108,39 @@ impl super::Engine for ReqwestEngine {
         let (url_tx, url_rx) =
             async_channel::bounded::<(SeedURL, Arc<DomainEntry>)>(workers * 4);
 
-        // Producer: flatten all domain batches into the URL channel.
+        // Producer: send URLs in round-robin domain order to prevent semaphore clustering.
+        //
+        // Sorted domain order [A1,A2,A3..An, B1,B2..Bn, ...] causes workers to cluster on
+        // the same domain's semaphore simultaneously. Round-robin order [A1,B1,C1,...,A2,B2,...]
+        // ensures each "wave" of workers hits different domains, eliminating semaphore contention
+        // and spreading DNS resolution across many nameservers simultaneously.
         let dm = Arc::clone(&domain_map);
         let producer = tokio::spawn(async move {
-            for batch in batches {
-                if let Some(entry_ref) = dm.get(&batch.domain) {
-                    let entry = Arc::clone(entry_ref.value());
-                    for url in batch.urls {
-                        if url_tx.send((url, Arc::clone(&entry))).await.is_err() {
+            // Pair each batch's URL list with its pre-created domain entry.
+            let domain_batches: Vec<(Vec<SeedURL>, Arc<DomainEntry>)> = batches
+                .into_iter()
+                .filter_map(|batch| {
+                    dm.get(&batch.domain)
+                        .map(|e| (batch.urls, Arc::clone(e.value())))
+                })
+                .collect();
+
+            let max_len = domain_batches
+                .iter()
+                .map(|(urls, _)| urls.len())
+                .max()
+                .unwrap_or(0);
+
+            // Send slot[i] from every domain before sending slot[i+1].
+            // Result: [A_slot0, B_slot0, C_slot0, ..., A_slot1, B_slot1, ...]
+            for slot in 0..max_len {
+                for (urls, entry) in &domain_batches {
+                    if let Some(url) = urls.get(slot) {
+                        if url_tx
+                            .send((url.clone(), Arc::clone(entry)))
+                            .await
+                            .is_err()
+                        {
                             return; // receivers all dropped
                         }
                     }
