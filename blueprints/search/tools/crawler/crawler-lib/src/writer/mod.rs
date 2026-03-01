@@ -1,3 +1,4 @@
+pub mod binary;
 pub mod devnull;
 pub mod duckdb_writer;
 pub mod parquet_writer;
