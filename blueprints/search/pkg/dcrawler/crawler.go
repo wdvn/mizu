@@ -214,6 +214,11 @@ func New(cfg Config) (*Crawler, error) {
 		cfg.SeedURLs = []string{fmt.Sprintf("https://%s/", cfg.Domain)}
 	}
 
+	// Auto-scale browser pages from available RAM when not explicitly set.
+	if (cfg.UseRod || cfg.UseLightpanda) && cfg.RodWorkers <= 0 {
+		cfg.RodWorkers = AutoBrowserPages(readProcMemAvailMB())
+	}
+
 	c := &Crawler{config: cfg}
 	c.setupTransport()
 	c.frontier = NewFrontier(cfg.Domain, cfg.FrontierSize, cfg.BloomCapacity, cfg.BloomFPR, cfg.IncludeSubdomain, cfg.DomainAliases)
@@ -369,6 +374,9 @@ func (c *Crawler) Run(ctx context.Context) error {
 	c.loadSeeds()
 
 	c.logInit("Frontier: %s seed URLs", fmtInt(c.frontier.Len()))
+	if c.config.UseRod || c.config.UseLightpanda {
+		c.logInit("Browser: %d tabs (auto from RAM)", c.config.RodWorkers)
+	}
 
 	// Sitemap discovery signal: closed when background sitemap discovery completes.
 	// The coordinator checks this to avoid premature exit while sitemaps load.
