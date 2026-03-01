@@ -878,6 +878,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "libc",
  "parquet",
  "rand 0.9.2",
  "reqwest",
