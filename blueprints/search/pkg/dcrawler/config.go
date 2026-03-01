@@ -50,6 +50,7 @@ type Config struct {
 	UseLightpanda     bool         // Use Lightpanda browser via CDP (alternative to Chrome/rod)
 	DomainAliases     []string     // Additional domains to treat as same-domain (e.g., "new.qq.com" for "news.qq.com")
 	RodNoRenderWait   bool         // Skip DOM stabilization wait (faster for SSG/static Next.js sites)
+	UserDataDir string // Chrome user-data-dir for persistent cookies/localStorage across restarts
 }
 
 // DefaultConfig returns optimal defaults for high-throughput single-domain crawling.

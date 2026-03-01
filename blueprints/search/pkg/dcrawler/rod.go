@@ -46,15 +46,21 @@ func detectChromeBin() string {
 }
 
 // newLauncher creates a rod launcher with Chrome path and server-safe flags.
-func newLauncher(headless bool) *launcher.Launcher {
+func newLauncher(cfg Config) *launcher.Launcher {
 	l := launcher.New().
-		Headless(headless).
+		Headless(cfg.RodHeadless).
 		Set("disable-blink-features", "AutomationControlled").
-		Set("disable-features", "IsolateOrigins,site-per-process").
+		Set("disable-features", "IsolateOrigins,site-per-process,VizDisplayCompositor").
 		Set("disable-dev-shm-usage", ""). // required in Docker/CI (no /dev/shm)
-		Set("no-sandbox", "")             // required when running as root on servers
+		Set("no-sandbox", "").            // required when running as root on servers
+		Set("window-size", "1920,1080").  // match fingerprintJS screen dimensions
+		Set("lang", "en-US").             // consistent locale
+		Set("accept-lang", "en-US,en;q=0.9")
 	if bin := detectChromeBin(); bin != "" {
 		l = l.Bin(bin)
+	}
+	if cfg.UserDataDir != "" {
+		l = l.UserDataDir(cfg.UserDataDir)
 	}
 	return l
 }
@@ -71,6 +77,23 @@ var skipP=/^\/_|^\/static\/|^\/assets\/|^\/webpack\/|^\/chunks\//;
 function X(t){if(!t||t.length>1000000)return;t=t.replace(/\\\//g,'/');R.lastIndex=0;for(var m;(m=R.exec(t))!==null;){var u=m[0].replace(/[),;.:!?'"]+$/,'');if(u.length>10&&u.length<2000)S.add(u)}Q.lastIndex=0;for(var m2;(m2=Q.exec(t))!==null;){var p=m2[1];if(!skip.test(p)&&!skipP.test(p))S.add(location.origin+p)}}
 var F=window.fetch;if(F){window.fetch=function(){return F.apply(this,arguments).then(function(r){try{var c=r.headers.get('content-type')||'';if(c.includes('json')||c.includes('html')||c.includes('text'))r.clone().text().then(X).catch(function(){})}catch(e){}return r})}}
 var P=XMLHttpRequest.prototype,O=P.send;P.send=function(){this.addEventListener('load',function(){try{var c=this.getResponseHeader('content-type')||'';if(c.includes('json')||c.includes('html')||c.includes('text'))X(this.responseText)}catch(e){}});return O.apply(this,arguments)}
+})()`
+
+// fingerprintJS patches headless-Chrome-detectable properties that go-rod/stealth doesn't cover.
+// Injected before page scripts via PageAddScriptToEvaluateOnNewDocument.
+const fingerprintJS = `(function(){
+// Screen dimensions: headless Chrome reports 0x0; real desktop = 1920x1080
+try{Object.defineProperty(screen,'width',{get:()=>1920});
+Object.defineProperty(screen,'height',{get:()=>1080});
+Object.defineProperty(screen,'availWidth',{get:()=>1920});
+Object.defineProperty(screen,'availHeight',{get:()=>1040});
+Object.defineProperty(screen,'colorDepth',{get:()=>24});
+Object.defineProperty(screen,'pixelDepth',{get:()=>24});}catch(e){}
+// outerWidth/Height: headless = 0; real Chrome = window size
+try{Object.defineProperty(window,'outerWidth',{get:()=>1920});
+Object.defineProperty(window,'outerHeight',{get:()=>1080});}catch(e){}
+// devicePixelRatio: headless = 1; consistent with non-retina desktop
+try{Object.defineProperty(window,'devicePixelRatio',{get:()=>1});}catch(e){}
 })()`
 
 // rodPool manages a headless Chrome browser and a pool of pages.
@@ -154,7 +177,7 @@ func cookiesToParams(cookies []*proto.NetworkCookie) []*proto.NetworkCookieParam
 }
 
 func newRodPool(cfg Config) (*rodPool, error) {
-	l := newLauncher(cfg.RodHeadless)
+	l := newLauncher(cfg)
 	controlURL, err := l.Launch()
 	if err != nil {
 		return nil, fmt.Errorf("rod launcher: %w", err)
@@ -194,6 +217,8 @@ func (rp *rodPool) getPage() (*rod.Page, error) {
 				UserAgent: rp.config.UserAgent,
 			})
 		}
+		// Inject screen/window dimension patches before any page scripts run.
+		_, _ = proto.PageAddScriptToEvaluateOnNewDocument{Source: fingerprintJS}.Call(p)
 		if rp.config.RodBlockResources {
 			setupResourceBlocking(p)
 		}
@@ -228,7 +253,7 @@ func (rp *rodPool) tryRestart() error {
 	rp.browser.Close()
 
 	// Launch new Chrome
-	l := newLauncher(rp.config.RodHeadless)
+	l := newLauncher(rp.config)
 	controlURL, err := l.Launch()
 	if err != nil {
 		return fmt.Errorf("rod launcher: %w", err)
