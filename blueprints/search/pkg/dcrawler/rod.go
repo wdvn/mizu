@@ -635,16 +635,32 @@ func (c *Crawler) rodFetchAndProcess(ctx context.Context, rp *rodPool, item Craw
 				if solveErr == nil && len(solvedCookies) > 0 {
 					rp.jar.store(domain, solvedCookies)
 					_ = page.SetCookies(cookiesToParams(solvedCookies))
+					// Set up a fresh DOMContentLoaded listener for re-navigation (dclCh is already consumed).
+					renavDCLCh := make(chan struct{}, 1)
+					go func() {
+						defer func() { recover() }()
+						p.EachEvent(func(e *proto.PageDomContentEventFired) (stop bool) {
+							return true
+						})()
+						select {
+						case renavDCLCh <- struct{}{}:
+						default:
+						}
+					}()
 					// Re-navigate with clearance cookies — CF should skip challenge.
 					renavCmd := proto.PageNavigate{URL: item.URL}
 					if _, renavErr := renavCmd.Call(p); renavErr == nil {
 						// Wait for DOM ready after re-navigation.
 						select {
-						case <-dclCh:
+						case <-renavDCLCh:
 						case <-time.After(timeout):
 						case <-fetchCtx.Done():
 						}
 					}
+				} else {
+					// Solver failed or returned no cookies — record as blocked and skip.
+					c.recordBlocked(item, "CF challenge: solver failed or no cookies", time.Since(start).Milliseconds())
+					return
 				}
 			}
 		}
