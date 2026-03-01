@@ -4,6 +4,18 @@
 > **Baseline:** 882 avg RPS, 5,481 peak (200K seeds, reqwest + binary writer, --no-retry).
 > The gap between avg and peak (6.2×) is the optimization opportunity.
 
+## Benchmark Results (server2, after v0.6.0 fixes)
+
+| Scenario | Before | After | Delta |
+|----------|--------|-------|-------|
+| 200K seeds, devnull, no-retry | 882 avg RPS, 3m46s | **1,708 avg RPS, 1m57s** | **+93% avg, -49% time** |
+| 50K seeds, devnull, no-retry | ~2,908 avg RPS (10K baseline) | **1,708 avg RPS** | (different seed quality) |
+| Peak RPS | 5,481 | 5,660 | +3% |
+| Timeouts (200K, devnull) | ~40% | <0.1% (51) | -99.8% |
+
+Key observation: 88% of HN seeds now fail fast with HTTP errors (404/403/gone) rather than timing out.
+The avg→peak gap narrowed from 6.2× to 3.3×. Goal: get avg within 2× of peak (2,830+ RPS).
+
 ---
 
 ## 1. Root Cause Analysis
@@ -234,20 +246,20 @@ Expose as `--adaptive-factor` flag (default 2.0, reduce to 1.5 for fast crawls).
 
 ## 4. Benchmark Targets
 
-| Scenario | Current | After Priority 1-2 | After All |
-|----------|---------|---------------------|-----------|
-| 200K seeds, devnull | 882 avg | ~1,500 avg | ~3,000 avg |
-| 200K seeds, binary | 882 avg | ~1,200 avg | ~2,500 avg |
-| 50K seeds (pre-filtered) | ~2,000 avg | ~4,000 avg | ~5,000 avg |
+| Scenario | Baseline | v0.6.0 | Next target |
+|----------|----------|--------|-------------|
+| 200K seeds, devnull | 882 avg RPS | **1,708 avg RPS** | 3,000+ avg |
+| 200K seeds, binary | 882 avg RPS | TBD | 2,500+ avg |
+| 200K seeds, with pass-2 | ~881K ok/1.27M (69.3%) | TBD | match or exceed |
 
 Note: 5,000 avg RPS is achievable with **pre-filtered seeds** (e.g., recent HN posts with
-higher OK rate). With full HN domain set (60% timeout), 5K sustained avg is harder
-because timeout handling dominates.
+higher OK rate) or when most seeds are alive. With full HN domain set (88% fast-fail),
+avg is capped by the time-to-process those fast failures.
 
-**Key insight:** Peak is already 5,481 RPS. The gap is caused by:
-1. Worker stalls on dead domains (fixed in v0.6.0)
-2. Bandwidth waste on large pages (Priority 1)
-3. Worker idle time between domain batches (Priority 2)
+**Key insight:** Peak is already 5,660 RPS. The avg→peak gap (3.3×) comes from:
+1. Workers finishing domains and waiting for next batch from channel
+2. Variable network latency (fast fails vs slow OKs in same batch)
+3. Domain-batch architecture: single-URL domains release workers immediately, multi-URL domains hold workers longer
 
 ---
 
