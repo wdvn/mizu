@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -15,6 +16,40 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/go-rod/stealth"
 )
+
+// detectChromeBin returns the Chrome/Chromium binary path to use.
+// Priority: $CHROME_BIN env var → common Linux paths → rod auto-detect.
+func detectChromeBin() string {
+	if p := os.Getenv("CHROME_BIN"); p != "" {
+		return p
+	}
+	candidates := []string{
+		"/usr/bin/chromium",
+		"/usr/bin/chromium-browser",
+		"/usr/bin/google-chrome",
+		"/usr/bin/google-chrome-stable",
+	}
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return "" // let rod auto-detect
+}
+
+// newLauncher creates a rod launcher with Chrome path and server-safe flags.
+func newLauncher(headless bool) *launcher.Launcher {
+	l := launcher.New().
+		Headless(headless).
+		Set("disable-blink-features", "AutomationControlled").
+		Set("disable-features", "IsolateOrigins,site-per-process").
+		Set("disable-dev-shm-usage", "").
+		Set("no-sandbox", "")
+	if bin := detectChromeBin(); bin != "" {
+		l = l.Bin(bin)
+	}
+	return l
+}
 
 // networkInterceptJS is injected before page scripts to capture URLs from XHR/fetch responses.
 // Catches article URLs loaded via API calls (news feeds, infinite scroll, AJAX pagination).
@@ -41,10 +76,7 @@ type rodPool struct {
 }
 
 func newRodPool(cfg Config) (*rodPool, error) {
-	l := launcher.New().
-		Headless(cfg.RodHeadless).
-		Set("disable-blink-features", "AutomationControlled").
-		Set("disable-features", "IsolateOrigins,site-per-process")
+	l := newLauncher(cfg.RodHeadless)
 	controlURL, err := l.Launch()
 	if err != nil {
 		return nil, fmt.Errorf("rod launcher: %w", err)
@@ -117,10 +149,7 @@ func (rp *rodPool) tryRestart() error {
 	rp.browser.Close()
 
 	// Launch new Chrome
-	l := launcher.New().
-		Headless(rp.config.RodHeadless).
-		Set("disable-blink-features", "AutomationControlled").
-		Set("disable-features", "IsolateOrigins,site-per-process")
+	l := newLauncher(rp.config.RodHeadless)
 	controlURL, err := l.Launch()
 	if err != nil {
 		return fmt.Errorf("rod launcher: %w", err)
@@ -402,29 +431,32 @@ func (c *Crawler) rodFetchAndProcess(ctx context.Context, rp *rodPool, item Craw
 		// Substantial server-rendered content — proceed with partial extraction.
 	}
 
-	// Phase: wait for DOM to stabilize (React/Next.js hydration + render).
-	// Polls document.body.innerHTML.length: stable for 600ms = hydration complete.
-	c.stats.SetRodPhase(workerID, "render")
-	_, _ = p.Timeout(5 * time.Second).Eval(`() => new Promise((resolve) => {
-		const afterDOM = () => {
-			let lastLen = document.body ? document.body.innerHTML.length : 0;
-			let stable = 0;
-			const check = () => {
-				const len = document.body ? document.body.innerHTML.length : 0;
-				if (len === lastLen) {
-					stable++;
-					if (stable >= 3) { resolve(); return; }
-				} else {
-					stable = 0;
-					lastLen = len;
-				}
-				setTimeout(check, 200);
+	// Skip render wait for SSG/static sites (--no-render-wait flag).
+	if !c.config.RodNoRenderWait {
+		// Phase: wait for DOM to stabilize (React/Next.js hydration + render).
+		// Polls document.body.innerHTML.length: stable for 600ms = hydration complete.
+		c.stats.SetRodPhase(workerID, "render")
+		_, _ = p.Timeout(5 * time.Second).Eval(`() => new Promise((resolve) => {
+			const afterDOM = () => {
+				let lastLen = document.body ? document.body.innerHTML.length : 0;
+				let stable = 0;
+				const check = () => {
+					const len = document.body ? document.body.innerHTML.length : 0;
+					if (len === lastLen) {
+						stable++;
+						if (stable >= 3) { resolve(); return; }
+					} else {
+						stable = 0;
+						lastLen = len;
+					}
+					setTimeout(check, 200);
+				};
+				setTimeout(check, 300);
 			};
-			setTimeout(check, 300);
-		};
-		if (document.readyState !== 'loading') afterDOM();
-		else document.addEventListener('DOMContentLoaded', afterDOM);
-	})`)
+			if (document.readyState !== 'loading') afterDOM();
+			else document.addEventListener('DOMContentLoaded', afterDOM);
+		})`)
+	}
 
 	// Render wait timeout is NOT fatal — the DOM is already "interactive".
 	// Just skip optional post-render steps (CF check, scroll) if deadline expired.
