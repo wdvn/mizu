@@ -1,3 +1,4 @@
+pub mod hyper_engine;
 pub mod reqwest_engine;
 
 use crate::config::Config;

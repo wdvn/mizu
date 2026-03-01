@@ -161,7 +161,7 @@ fn flush_result_batch(conn: &Connection, batch: &[CrawlResult]) -> Result<()> {
 struct ResultShard {
     batch: Mutex<Vec<CrawlResult>>,
     batch_size: usize,
-    tx: Sender<Vec<CrawlResult>>,
+    tx: Mutex<Option<Sender<Vec<CrawlResult>>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -187,9 +187,17 @@ impl ResultShard {
         Ok(Self {
             batch: Mutex::new(Vec::with_capacity(batch_size)),
             batch_size,
-            tx,
+            tx: Mutex::new(Some(tx)),
             handle: Mutex::new(Some(handle)),
         })
+    }
+
+    fn send_batch(&self, b: Vec<CrawlResult>) -> Result<()> {
+        let guard = self.tx.lock().unwrap();
+        if let Some(tx) = guard.as_ref() {
+            tx.send(b).map_err(|_| anyhow::anyhow!("flusher channel closed"))?;
+        }
+        Ok(())
     }
 
     fn add(&self, result: CrawlResult) -> Result<()> {
@@ -206,11 +214,8 @@ impl ResultShard {
             }
         };
         if let Some(b) = batch_to_send {
-            let count = b.len();
-            self.tx
-                .send(b)
-                .map_err(|_| anyhow::anyhow!("flusher channel closed"))?;
-            debug!("sent batch of {} to flusher", count);
+            debug!("sent batch of {} to flusher", b.len());
+            self.send_batch(b)?;
         }
         Ok(())
     }
@@ -228,20 +233,25 @@ impl ResultShard {
             }
         };
         if let Some(b) = batch_to_send {
-            self.tx
-                .send(b)
-                .map_err(|_| anyhow::anyhow!("flusher channel closed"))?;
+            self.send_batch(b)?;
         }
         Ok(())
     }
 
     fn close(&self) -> Result<()> {
-        // Flush remaining
+        // 1. Flush remaining data into the channel
         self.flush()?;
-        // Drop the sender clone to signal the flusher thread to exit.
-        // Since `self.tx` can't be moved out, we rely on all senders being dropped
-        // when the struct is dropped. But for explicit close, we join the handle.
-        // The flusher will exit once all senders are dropped.
+        // 2. Drop the sender — this signals rx.iter() to terminate in the flusher thread
+        {
+            let mut guard = self.tx.lock().unwrap();
+            *guard = None; // drops the Sender
+        }
+        // 3. Join the flusher thread to ensure all data is written to DuckDB
+        if let Ok(mut guard) = self.handle.lock() {
+            if let Some(h) = guard.take() {
+                let _ = h.join();
+            }
+        }
         Ok(())
     }
 }
@@ -314,7 +324,7 @@ impl ResultWriter for DuckDBResultWriter {
 
     fn close(&self) -> Result<()> {
         for shard in &self.shards {
-            shard.close()?;
+            shard.close()?; // flushes remaining, drops sender, joins flusher thread
         }
         info!(
             "DuckDBResultWriter closed, total written: {}",
@@ -324,26 +334,11 @@ impl ResultWriter for DuckDBResultWriter {
     }
 }
 
-// When the writer is dropped, signal flusher threads to stop and join them.
+// When the writer is dropped, ensure all shards are properly closed.
 impl Drop for DuckDBResultWriter {
     fn drop(&mut self) {
-        // Flush remaining batches (best effort).
         for shard in &self.shards {
-            let _ = shard.flush();
-        }
-        // Note: the crossbeam Sender is dropped when self.shards is dropped,
-        // which causes rx.iter() to terminate in the flusher thread.
-        // We cannot join here because `shards` is a Vec behind &self,
-        // but the JoinHandle is in a Mutex<Option<>> so we can take it.
-        for shard in &self.shards {
-            if let Ok(mut guard) = shard.handle.lock() {
-                if let Some(h) = guard.take() {
-                    // We can't drop the sender first from here since shard owns it.
-                    // The sender will be dropped when the Vec is dropped after this fn.
-                    // So we just detach the thread (it will finish once sender drops).
-                    drop(h);
-                }
-            }
+            let _ = shard.close(); // idempotent: close() is safe to call multiple times
         }
     }
 }
@@ -454,8 +449,8 @@ pub struct DuckDBFailureWriter {
     url_batch: Mutex<Vec<FailedURL>>,
     domain_batch: Mutex<Vec<FailedDomain>>,
     batch_size: usize,
-    url_tx: Sender<Vec<FailedURL>>,
-    domain_tx: Sender<Vec<FailedDomain>>,
+    url_tx: Mutex<Option<Sender<Vec<FailedURL>>>>,
+    domain_tx: Mutex<Option<Sender<Vec<FailedDomain>>>>,
     handles: Mutex<Vec<Option<JoinHandle<()>>>>,
 }
 
@@ -512,8 +507,8 @@ impl DuckDBFailureWriter {
             url_batch: Mutex::new(Vec::with_capacity(batch_size)),
             domain_batch: Mutex::new(Vec::with_capacity(batch_size)),
             batch_size,
-            url_tx,
-            domain_tx,
+            url_tx: Mutex::new(Some(url_tx)),
+            domain_tx: Mutex::new(Some(domain_tx)),
             handles: Mutex::new(vec![Some(url_handle), Some(domain_handle)]),
         })
     }
@@ -525,18 +520,15 @@ impl FailureWriter for DuckDBFailureWriter {
             let mut batch = self.url_batch.lock().unwrap();
             batch.push(failed);
             if batch.len() >= self.batch_size {
-                Some(std::mem::replace(
-                    &mut *batch,
-                    Vec::with_capacity(self.batch_size),
-                ))
+                Some(std::mem::replace(&mut *batch, Vec::with_capacity(self.batch_size)))
             } else {
                 None
             }
         };
         if let Some(b) = batch_to_send {
-            self.url_tx
-                .send(b)
-                .map_err(|_| anyhow::anyhow!("failed_urls flusher channel closed"))?;
+            if let Some(tx) = self.url_tx.lock().unwrap().as_ref() {
+                tx.send(b).map_err(|_| anyhow::anyhow!("failed_urls flusher channel closed"))?;
+            }
         }
         Ok(())
     }
@@ -546,63 +538,57 @@ impl FailureWriter for DuckDBFailureWriter {
             let mut batch = self.domain_batch.lock().unwrap();
             batch.push(failed);
             if batch.len() >= self.batch_size {
-                Some(std::mem::replace(
-                    &mut *batch,
-                    Vec::with_capacity(self.batch_size),
-                ))
+                Some(std::mem::replace(&mut *batch, Vec::with_capacity(self.batch_size)))
             } else {
                 None
             }
         };
         if let Some(b) = batch_to_send {
-            self.domain_tx
-                .send(b)
-                .map_err(|_| anyhow::anyhow!("failed_domains flusher channel closed"))?;
+            if let Some(tx) = self.domain_tx.lock().unwrap().as_ref() {
+                tx.send(b).map_err(|_| anyhow::anyhow!("failed_domains flusher channel closed"))?;
+            }
         }
         Ok(())
     }
 
     fn flush(&self) -> Result<()> {
-        // Flush URL batch
         let url_batch = {
             let mut batch = self.url_batch.lock().unwrap();
-            if batch.is_empty() {
-                None
-            } else {
-                Some(std::mem::replace(
-                    &mut *batch,
-                    Vec::with_capacity(self.batch_size),
-                ))
-            }
+            if batch.is_empty() { None }
+            else { Some(std::mem::replace(&mut *batch, Vec::with_capacity(self.batch_size))) }
         };
         if let Some(b) = url_batch {
-            self.url_tx
-                .send(b)
-                .map_err(|_| anyhow::anyhow!("failed_urls flusher channel closed"))?;
+            if let Some(tx) = self.url_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(b);
+            }
         }
-
-        // Flush domain batch
         let domain_batch = {
             let mut batch = self.domain_batch.lock().unwrap();
-            if batch.is_empty() {
-                None
-            } else {
-                Some(std::mem::replace(
-                    &mut *batch,
-                    Vec::with_capacity(self.batch_size),
-                ))
-            }
+            if batch.is_empty() { None }
+            else { Some(std::mem::replace(&mut *batch, Vec::with_capacity(self.batch_size))) }
         };
         if let Some(b) = domain_batch {
-            self.domain_tx
-                .send(b)
-                .map_err(|_| anyhow::anyhow!("failed_domains flusher channel closed"))?;
+            if let Some(tx) = self.domain_tx.lock().unwrap().as_ref() {
+                let _ = tx.send(b);
+            }
         }
         Ok(())
     }
 
     fn close(&self) -> Result<()> {
+        // 1. Flush remaining into channels
         self.flush()?;
+        // 2. Drop both senders to signal flusher threads to exit
+        { *self.url_tx.lock().unwrap() = None; }
+        { *self.domain_tx.lock().unwrap() = None; }
+        // 3. Join both flusher threads
+        if let Ok(mut handles) = self.handles.lock() {
+            for h in handles.iter_mut() {
+                if let Some(handle) = h.take() {
+                    let _ = handle.join();
+                }
+            }
+        }
         info!("DuckDBFailureWriter closed");
         Ok(())
     }
@@ -610,15 +596,8 @@ impl FailureWriter for DuckDBFailureWriter {
 
 impl Drop for DuckDBFailureWriter {
     fn drop(&mut self) {
-        let _ = self.flush();
-        // Handles are joined after senders are dropped (when struct is dropped).
-        if let Ok(mut handles) = self.handles.lock() {
-            for h in handles.iter_mut() {
-                if let Some(handle) = h.take() {
-                    drop(handle);
-                }
-            }
-        }
+        // close() is idempotent (Option::take), safe to call from drop
+        let _ = self.close();
     }
 }
 

@@ -8,7 +8,7 @@ tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate"] }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["client-legacy", "tokio", "http1", "http2"] }
-hyper-rustls = { version = "0.27", features = ["http2", "ring"] }
+hyper-rustls = { version = "0.27", features = ["http2", "ring", "webpki-tokio"] }
 rustls = "0.23"
 http-body-util = "0.1"
 bytes = "1"

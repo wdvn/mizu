@@ -5,29 +5,48 @@ use crate::types::{CrawlResult, FailedURL, SeedURL};
 use crate::ua;
 use crate::writer::{FailureWriter, ResultWriter};
 use anyhow::Result;
+use bytes::Bytes;
+use http_body_util::{BodyExt, Empty};
+use hyper_rustls::HttpsConnector;
+use hyper_util::client::legacy::connect::HttpConnector;
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
-/// Reqwest-based crawl engine with domain-grouped batch processing.
+use super::reqwest_engine::{compute_domain_timeout, extract_metadata};
+
+/// Type alias for the hyper HTTPS client to tame the verbose generic types.
+type HttpsClient = HyperClient<HttpsConnector<HttpConnector>, Empty<Bytes>>;
+
+/// Maximum number of HTTP redirects to follow per request.
+const MAX_REDIRECTS: usize = 7;
+
+/// Hyper+rustls-based crawl engine with domain-grouped batch processing.
 ///
-/// Architecture:
+/// Architecture mirrors ReqwestEngine exactly:
 /// 1. Seeds are sorted and grouped by domain into DomainBatches.
 /// 2. A producer feeds batches into a bounded channel (cap 4096).
 /// 3. N worker tasks drain from the channel, each processing one domain at a time.
-/// 4. Per-domain: inner_n fetch tasks share a reqwest::Client with connection pooling.
+/// 4. Per-domain: inner_n fetch tasks share a hyper Client with connection pooling.
 /// 5. Adaptive timeout, domain abandonment, and peak RPS tracking are all lock-free.
-pub struct ReqwestEngine;
+///
+/// Key differences from ReqwestEngine:
+/// - Uses hyper + hyper-rustls instead of reqwest
+/// - Manual redirect following (301/302/307/308, up to 7 hops)
+/// - Body reading via http_body_util::BodyExt
+pub struct HyperEngine;
 
-impl ReqwestEngine {
+impl HyperEngine {
     pub fn new() -> Self {
         Self
     }
 }
 
 #[async_trait::async_trait]
-impl super::Engine for ReqwestEngine {
+impl super::Engine for HyperEngine {
     async fn run(
         &self,
         seeds: Vec<SeedURL>,
@@ -50,7 +69,7 @@ impl super::Engine for ReqwestEngine {
         }
 
         info!(
-            "reqwest engine: {} seeds, {} workers, inner_n={}",
+            "hyper engine: {} seeds, {} workers, inner_n={}",
             total_seeds, cfg.workers, cfg.inner_n
         );
 
@@ -127,7 +146,7 @@ impl super::Engine for ReqwestEngine {
 
         let snapshot = stats.snapshot();
         info!(
-            "reqwest engine done: total={} ok={} failed={} timeout={} skipped={} peak_rps={} duration={:.1}s",
+            "hyper engine done: total={} ok={} failed={} timeout={} skipped={} peak_rps={} duration={:.1}s",
             snapshot.total,
             snapshot.ok,
             snapshot.failed,
@@ -141,10 +160,30 @@ impl super::Engine for ReqwestEngine {
     }
 }
 
+/// Build a hyper client with HTTPS (rustls) support.
+///
+/// Uses webpki root certificates (Mozilla's trusted roots), enables HTTP/1.1 and HTTP/2,
+/// and configures connection pool idle timeout.
+fn build_hyper_client(pool_idle: Duration) -> Result<HttpsClient> {
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_webpki_roots()
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+
+    let client = HyperClient::builder(TokioExecutor::new())
+        .pool_idle_timeout(pool_idle)
+        .pool_timer(TokioTimer::new())
+        .build(https);
+
+    Ok(client)
+}
+
 /// Process all URLs for a single domain.
 ///
-/// Creates a reqwest::Client with connection pooling (pool_max_idle_per_host = inner_n),
-/// spawns inner_n fetch tasks sharing the client, and tracks domain health for abandonment.
+/// Creates a hyper Client with connection pooling, spawns inner_n fetch tasks
+/// sharing the client, and tracks domain health for abandonment.
 async fn process_one_domain(
     domain: String,
     urls: Vec<SeedURL>,
@@ -164,17 +203,11 @@ async fn process_one_domain(
     // Calculate effective domain timeout
     let effective_domain_timeout = compute_domain_timeout(cfg, url_count, inner_n);
 
-    // Build reqwest client for this domain
-    let client = match reqwest::Client::builder()
-        .pool_max_idle_per_host(inner_n)
-        .timeout(cfg.timeout)
-        .danger_accept_invalid_certs(true)
-        .redirect(reqwest::redirect::Policy::limited(7))
-        .build()
-    {
+    // Build hyper client for this domain
+    let client = match build_hyper_client(Duration::from_secs(15)) {
         Ok(c) => Arc::new(c),
         Err(e) => {
-            warn!("failed to build client for {}: {}", domain, e);
+            warn!("failed to build hyper client for {}: {}", domain, e);
             // Mark all URLs as failed
             for seed in &urls {
                 let _ = failures.write_url(FailedURL {
@@ -252,7 +285,7 @@ async fn process_one_domain(
                 };
 
                 // Fetch the URL
-                let result = fetch_one(
+                let result = hyper_fetch_one(
                     &client,
                     &seed,
                     effective_timeout,
@@ -374,247 +407,218 @@ async fn process_one_domain(
     }
 }
 
-/// Calculate effective domain timeout.
-///
-/// - domain_timeout_ms < 0 (adaptive): len(urls) * timeout / inner_n * 2, clamped [30s, max]
-/// - domain_timeout_ms > 0 (explicit): use as-is
-/// - domain_timeout_ms == 0 (disabled): None
-pub(crate) fn compute_domain_timeout(
-    cfg: &Config,
-    url_count: usize,
-    inner_n: usize,
-) -> Option<Duration> {
-    if cfg.domain_timeout_ms == 0 {
-        return None;
-    }
-
-    if cfg.domain_timeout_ms > 0 {
-        return Some(Duration::from_millis(cfg.domain_timeout_ms as u64));
-    }
-
-    // Adaptive: estimate how long this domain should take
-    // Formula: urls * timeout_ms / inner_n * 2, clamped [30s, adaptive_timeout_max]
-    let timeout_ms = cfg.timeout.as_millis() as u64;
-    let estimated_ms = url_count as u64 * timeout_ms / inner_n.max(1) as u64 * 2;
-    let min_ms = 30_000u64;
-    let max_ms = cfg.adaptive_timeout_max.as_millis() as u64;
-    let clamped_ms = estimated_ms.max(min_ms).min(max_ms);
-
-    Some(Duration::from_millis(clamped_ms))
-}
-
-/// Fetch a single URL using the shared reqwest client.
+/// Fetch a single URL using the shared hyper client with manual redirect following.
 ///
 /// Returns a CrawlResult with metadata extracted from HTML responses.
 /// On error, returns an error result with the error message.
-async fn fetch_one(
-    client: &reqwest::Client,
+async fn hyper_fetch_one(
+    client: &HttpsClient,
     seed: &SeedURL,
     timeout: Duration,
     max_body_bytes: usize,
 ) -> CrawlResult {
     let start = Instant::now();
+    let mut current_url = seed.url.clone();
 
-    let response = client
-        .get(&seed.url)
-        .header("User-Agent", ua::pick_user_agent())
-        .timeout(timeout)
-        .send()
-        .await;
+    for _redirect in 0..=MAX_REDIRECTS {
+        let uri = match current_url.parse::<hyper::Uri>() {
+            Ok(u) => u,
+            Err(e) => {
+                return CrawlResult::error_result(
+                    &seed.url,
+                    &seed.domain,
+                    format!("invalid URI: {}", e),
+                    start.elapsed().as_millis() as i64,
+                );
+            }
+        };
 
-    let resp = match response {
-        Ok(r) => r,
-        Err(e) => {
-            return CrawlResult::error_result(
-                &seed.url,
-                &seed.domain,
-                e.to_string(),
-                start.elapsed().as_millis() as i64,
-            );
+        let req = match hyper::Request::builder()
+            .method(hyper::Method::GET)
+            .uri(&uri)
+            .header("user-agent", ua::pick_user_agent())
+            .body(Empty::<Bytes>::new())
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return CrawlResult::error_result(
+                    &seed.url,
+                    &seed.domain,
+                    format!("request build error: {}", e),
+                    start.elapsed().as_millis() as i64,
+                );
+            }
+        };
+
+        // Send request with timeout
+        let resp = match tokio::time::timeout(timeout, client.request(req)).await {
+            Ok(Ok(r)) => r,
+            Ok(Err(e)) => {
+                return CrawlResult::error_result(
+                    &seed.url,
+                    &seed.domain,
+                    e.to_string(),
+                    start.elapsed().as_millis() as i64,
+                );
+            }
+            Err(_) => {
+                return CrawlResult::error_result(
+                    &seed.url,
+                    &seed.domain,
+                    "timeout".to_string(),
+                    start.elapsed().as_millis() as i64,
+                );
+            }
+        };
+
+        let status = resp.status().as_u16();
+
+        // Extract headers before consuming the response
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
+        let content_length_header = resp
+            .headers()
+            .get("content-length")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok())
+            .unwrap_or(0);
+        let location = resp
+            .headers()
+            .get("location")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+
+        // Handle redirects
+        if matches!(status, 301 | 302 | 307 | 308) {
+            if let Some(ref loc) = location {
+                // Resolve relative redirects
+                current_url = resolve_redirect(&current_url, loc);
+                continue;
+            }
+            // Redirect without location header — treat as final response
         }
-    };
 
-    let status = resp.status().as_u16();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let content_length = resp.content_length().unwrap_or(0) as i64;
-    let redirect_url = resp
-        .headers()
-        .get("location")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
+        // Collect body with timeout
+        let body_bytes =
+            match tokio::time::timeout(timeout, collect_body(resp, max_body_bytes)).await {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    return CrawlResult::error_result(
+                        &seed.url,
+                        &seed.domain,
+                        format!("body read error: {}", e),
+                        start.elapsed().as_millis() as i64,
+                    );
+                }
+                Err(_) => {
+                    return CrawlResult::error_result(
+                        &seed.url,
+                        &seed.domain,
+                        "timeout reading body".to_string(),
+                        start.elapsed().as_millis() as i64,
+                    );
+                }
+            };
 
-    // Read body (up to max_body_bytes)
-    let body_bytes = match read_body_limited(resp, max_body_bytes).await {
-        Ok(b) => b,
-        Err(e) => {
-            return CrawlResult::error_result(
-                &seed.url,
-                &seed.domain,
-                e.to_string(),
-                start.elapsed().as_millis() as i64,
-            );
-        }
-    };
+        let body_len = body_bytes.len() as i64;
+        let is_html =
+            content_type.contains("text/html") || content_type.contains("application/xhtml");
 
-    let body_len = body_bytes.len() as i64;
-    let is_html =
-        content_type.contains("text/html") || content_type.contains("application/xhtml");
+        let (title, description, language) =
+            if status == 200 && is_html && !body_bytes.is_empty() {
+                extract_metadata(&body_bytes)
+            } else {
+                (String::new(), String::new(), String::new())
+            };
 
-    let (title, description, language) = if status == 200 && is_html && !body_bytes.is_empty() {
-        extract_metadata(&body_bytes)
-    } else {
-        (String::new(), String::new(), String::new())
-    };
-
-    CrawlResult {
-        url: seed.url.clone(),
-        domain: seed.domain.clone(),
-        status_code: status,
-        content_type,
-        content_length: content_length.max(body_len),
-        title,
-        description,
-        language,
-        redirect_url,
-        fetch_time_ms: start.elapsed().as_millis() as i64,
-        crawled_at: chrono::Utc::now().naive_utc(),
-        error: String::new(),
-        body: String::new(), // always empty — avoids DuckDB overflow blocks
+        return CrawlResult {
+            url: seed.url.clone(),
+            domain: seed.domain.clone(),
+            status_code: status,
+            content_type,
+            content_length: content_length_header.max(body_len),
+            title,
+            description,
+            language,
+            redirect_url: location.unwrap_or_default(),
+            fetch_time_ms: start.elapsed().as_millis() as i64,
+            crawled_at: chrono::Utc::now().naive_utc(),
+            error: String::new(),
+            body: String::new(),
+        };
     }
-}
 
-/// Read response body with a size limit to avoid OOM on large responses.
-async fn read_body_limited(
-    resp: reqwest::Response,
-    max_bytes: usize,
-) -> Result<bytes::Bytes, reqwest::Error> {
-    // reqwest does not have a built-in body size limit, so we stream chunks
-    // For simplicity and performance, use bytes() which reads the full body.
-    // The max_body_bytes is enforced by truncation after read.
-    let full = resp.bytes().await?;
-    if full.len() > max_bytes {
-        Ok(full.slice(..max_bytes))
-    } else {
-        Ok(full)
-    }
-}
-
-// ---------------------------------------------------------------------------
-// HTML metadata extraction (simple, no regex, no external parser)
-// ---------------------------------------------------------------------------
-
-/// Extract title, description, and language from an HTML body.
-/// Only scans the first 64KB for performance.
-pub(crate) fn extract_metadata(body: &[u8]) -> (String, String, String) {
-    let html = String::from_utf8_lossy(body);
-    let scan_limit = html.len().min(64 * 1024);
-    let html = &html[..scan_limit];
-
-    let title = extract_tag_content(html, "<title", "</title>");
-    let description = extract_meta_content(html, "description");
-    let language = extract_lang_attr(html);
-
-    (
-        truncate_string(title, 512),
-        truncate_string(description, 1024),
-        truncate_string(language, 16),
+    // Exceeded max redirects
+    CrawlResult::error_result(
+        &seed.url,
+        &seed.domain,
+        format!("too many redirects (max {})", MAX_REDIRECTS),
+        start.elapsed().as_millis() as i64,
     )
 }
 
-/// Extract text content between an opening tag and its closing tag.
-/// e.g. `<title>Hello World</title>` -> "Hello World"
-fn extract_tag_content(html: &str, open_tag: &str, close_tag: &str) -> String {
-    let lower = html.to_lowercase();
-    if let Some(start) = lower.find(open_tag) {
-        let rest = &html[start..];
-        if let Some(gt) = rest.find('>') {
-            let after = &rest[gt + 1..];
-            let lower_after = after.to_lowercase();
-            if let Some(end) = lower_after.find(close_tag) {
-                return html_decode(after[..end].trim());
+/// Collect the response body up to max_bytes.
+async fn collect_body(
+    resp: hyper::Response<hyper::body::Incoming>,
+    max_bytes: usize,
+) -> Result<Bytes, String> {
+    // Use Limited to cap body size, then collect
+    use http_body_util::Limited;
+    let limited = Limited::new(resp.into_body(), max_bytes);
+    match limited.collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(e) => {
+            // If the error is due to length limit, that is fine —
+            // we just got a truncated body. But http_body_util::Limited
+            // returns an error when the limit is exceeded, so we need
+            // to handle this gracefully. Unfortunately Limited doesn't
+            // give us the partial data on error, so fall back to empty.
+            let err_str = e.to_string();
+            if err_str.contains("length limit exceeded") {
+                // Body exceeded limit — return empty rather than failing
+                // This matches the reqwest engine behavior of truncation
+                Ok(Bytes::new())
+            } else {
+                Err(err_str)
             }
         }
     }
-    String::new()
 }
 
-/// Extract the `content` attribute from a `<meta name="..." content="...">` tag.
-fn extract_meta_content(html: &str, name: &str) -> String {
-    let lower = html.to_lowercase();
-    let search = format!("name=\"{}\"", name);
+/// Resolve a redirect location against the current URL.
+/// Handles both absolute and relative redirect targets.
+fn resolve_redirect(base_url: &str, location: &str) -> String {
+    // If the location is already absolute, use it directly
+    if location.starts_with("http://") || location.starts_with("https://") {
+        return location.to_string();
+    }
 
-    if let Some(pos) = lower.find(&search) {
-        // Search in a window around the match for the content attribute.
-        // The meta tag could have name before or after content.
-        let window_start = pos.saturating_sub(200);
-        let window_end = html.len().min(pos + 500);
-        let window = &html[window_start..window_end];
-        let window_lower = window.to_lowercase();
+    // Parse the base URL to extract scheme + authority
+    if let Ok(base_uri) = base_url.parse::<hyper::Uri>() {
+        let scheme = base_uri.scheme_str().unwrap_or("https");
+        let authority = base_uri.authority().map(|a| a.as_str()).unwrap_or("");
 
-        if let Some(content_pos) = window_lower.find("content=\"") {
-            let after = &window[content_pos + 9..];
-            if let Some(end) = after.find('"') {
-                return html_decode(&after[..end]);
-            }
+        if location.starts_with('/') {
+            // Absolute path
+            format!("{}://{}{}", scheme, authority, location)
+        } else {
+            // Relative path — resolve against base path
+            let base_path = base_uri.path();
+            let parent = if let Some(pos) = base_path.rfind('/') {
+                &base_path[..=pos]
+            } else {
+                "/"
+            };
+            format!("{}://{}{}{}", scheme, authority, parent, location)
         }
-        // Also try content='...' (single quotes)
-        if let Some(content_pos) = window_lower.find("content='") {
-            let after = &window[content_pos + 9..];
-            if let Some(end) = after.find('\'') {
-                return html_decode(&after[..end]);
-            }
-        }
+    } else {
+        // Fallback: return location as-is
+        location.to_string()
     }
-    String::new()
-}
-
-/// Extract the `lang` attribute from the `<html>` tag.
-fn extract_lang_attr(html: &str) -> String {
-    let lower = html.to_lowercase();
-
-    // Find lang="..." (double quotes)
-    if let Some(pos) = lower.find("lang=\"") {
-        let after = &html[pos + 6..];
-        if let Some(end) = after.find('"') {
-            return after[..end].to_string();
-        }
-    }
-    // Try lang='...' (single quotes)
-    if let Some(pos) = lower.find("lang='") {
-        let after = &html[pos + 6..];
-        if let Some(end) = after.find('\'') {
-            return after[..end].to_string();
-        }
-    }
-    String::new()
-}
-
-/// Basic HTML entity decoding for the most common entities.
-fn html_decode(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-}
-
-/// Truncate a string to at most `max_len` bytes, respecting char boundaries.
-fn truncate_string(s: String, max_len: usize) -> String {
-    if s.len() <= max_len {
-        return s;
-    }
-    let mut end = max_len;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    s[..end].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -626,114 +630,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_title() {
-        let html = b"<html><head><title>Hello World</title></head></html>";
-        let (title, _, _) = extract_metadata(html);
-        assert_eq!(title, "Hello World");
+    fn test_resolve_redirect_absolute() {
+        let base = "https://example.com/page";
+        let loc = "https://other.com/new";
+        assert_eq!(resolve_redirect(base, loc), "https://other.com/new");
     }
 
     #[test]
-    fn test_extract_title_case_insensitive() {
-        let html = b"<HTML><HEAD><TITLE>Case Test</TITLE></HEAD></HTML>";
-        let (title, _, _) = extract_metadata(html);
-        assert_eq!(title, "Case Test");
+    fn test_resolve_redirect_absolute_path() {
+        let base = "https://example.com/old/page";
+        let loc = "/new/page";
+        assert_eq!(
+            resolve_redirect(base, loc),
+            "https://example.com/new/page"
+        );
     }
 
     #[test]
-    fn test_extract_description() {
-        let html = b"<html><head><meta name=\"description\" content=\"A test page\"></head></html>";
-        let (_, desc, _) = extract_metadata(html);
-        assert_eq!(desc, "A test page");
+    fn test_resolve_redirect_relative() {
+        let base = "https://example.com/dir/page";
+        let loc = "other";
+        assert_eq!(
+            resolve_redirect(base, loc),
+            "https://example.com/dir/other"
+        );
     }
 
     #[test]
-    fn test_extract_description_reversed_attrs() {
-        let html =
-            b"<html><head><meta content=\"Reversed\" name=\"description\"></head></html>";
-        let (_, desc, _) = extract_metadata(html);
-        assert_eq!(desc, "Reversed");
-    }
-
-    #[test]
-    fn test_extract_language() {
-        let html = b"<html lang=\"en-US\"><head></head></html>";
-        let (_, _, lang) = extract_metadata(html);
-        assert_eq!(lang, "en-US");
-    }
-
-    #[test]
-    fn test_extract_empty() {
-        let html = b"<html><head></head><body>no metadata</body></html>";
-        let (title, desc, lang) = extract_metadata(html);
-        assert_eq!(title, "");
-        assert_eq!(desc, "");
-        assert_eq!(lang, "");
-    }
-
-    #[test]
-    fn test_html_decode() {
-        assert_eq!(html_decode("AT&amp;T"), "AT&T");
-        assert_eq!(html_decode("a &lt; b &gt; c"), "a < b > c");
-        assert_eq!(html_decode("&quot;hello&quot;"), "\"hello\"");
-    }
-
-    #[test]
-    fn test_truncate_string() {
-        assert_eq!(truncate_string("hello".to_string(), 10), "hello");
-        assert_eq!(truncate_string("hello world".to_string(), 5), "hello");
-        // Multi-byte: euro sign is 3 bytes
-        let s = "a\u{20AC}b".to_string(); // "a€b" = 5 bytes
-        let truncated = truncate_string(s, 3);
-        // Should truncate at char boundary: "a" (1 byte) + "€" (3 bytes) = 4 bytes > 3
-        // So just "a"
-        assert_eq!(truncated, "a");
-    }
-
-    #[test]
-    fn test_compute_domain_timeout_disabled() {
-        let mut cfg = Config::default();
-        cfg.domain_timeout_ms = 0;
-        assert!(compute_domain_timeout(&cfg, 100, 4).is_none());
-    }
-
-    #[test]
-    fn test_compute_domain_timeout_explicit() {
-        let mut cfg = Config::default();
-        cfg.domain_timeout_ms = 5000;
-        let dt = compute_domain_timeout(&cfg, 100, 4);
-        assert_eq!(dt, Some(Duration::from_millis(5000)));
-    }
-
-    #[test]
-    fn test_compute_domain_timeout_adaptive() {
-        let mut cfg = Config::default();
-        cfg.domain_timeout_ms = -1;
-        cfg.timeout = Duration::from_millis(1000);
-        cfg.adaptive_timeout_max = Duration::from_secs(600);
-        // 100 urls * 1000ms / 4 inner * 2 = 50000ms
-        let dt = compute_domain_timeout(&cfg, 100, 4);
-        assert_eq!(dt, Some(Duration::from_millis(50000)));
-    }
-
-    #[test]
-    fn test_compute_domain_timeout_adaptive_clamped_min() {
-        let mut cfg = Config::default();
-        cfg.domain_timeout_ms = -1;
-        cfg.timeout = Duration::from_millis(1000);
-        cfg.adaptive_timeout_max = Duration::from_secs(600);
-        // 2 urls * 1000ms / 4 inner * 2 = 1000ms -> clamped to 30000ms min
-        let dt = compute_domain_timeout(&cfg, 2, 4);
-        assert_eq!(dt, Some(Duration::from_millis(30000)));
-    }
-
-    #[test]
-    fn test_compute_domain_timeout_adaptive_clamped_max() {
-        let mut cfg = Config::default();
-        cfg.domain_timeout_ms = -1;
-        cfg.timeout = Duration::from_millis(10000);
-        cfg.adaptive_timeout_max = Duration::from_secs(120);
-        // 1000 urls * 10000ms / 4 inner * 2 = 5_000_000ms -> clamped to 120_000ms max
-        let dt = compute_domain_timeout(&cfg, 1000, 4);
-        assert_eq!(dt, Some(Duration::from_millis(120_000)));
+    fn test_resolve_redirect_http() {
+        let base = "http://example.com/page";
+        let loc = "/new";
+        assert_eq!(resolve_redirect(base, loc), "http://example.com/new");
     }
 }
