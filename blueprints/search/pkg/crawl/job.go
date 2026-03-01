@@ -20,6 +20,7 @@ type JobConfig struct {
 	InsecureTLS         bool
 	DomainFailThreshold int
 	DomainTimeout       time.Duration // 0=disabled, <0=adaptive per-domain
+	AdaptiveTimeoutMax  time.Duration // upper bound for adaptive DomainTimeout (0=default 10min); lower values free workers faster from slow domains
 	DomainDeadProbe     int           // abandon dead-HTTP domains after N timeouts with 0 successes (0=disabled)
 	DomainStallRatio    int           // abandon stalling domains when timeouts ≥ successes×ratio (0=disabled, e.g. 20 = >95% timeout rate)
 	BatchSize           int
@@ -116,6 +117,9 @@ func RunJob(ctx context.Context, seeds []SeedURL, dns DNSCache, cfg JobConfig) (
 	}
 	if cfg.DomainTimeout != 0 {
 		engCfg.DomainTimeout = cfg.DomainTimeout // <0 = adaptive sentinel
+	}
+	if cfg.AdaptiveTimeoutMax > 0 {
+		engCfg.AdaptiveTimeoutMax = cfg.AdaptiveTimeoutMax
 	}
 	if cfg.DomainDeadProbe > 0 {
 		engCfg.DomainDeadProbe = cfg.DomainDeadProbe

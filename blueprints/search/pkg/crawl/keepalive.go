@@ -230,8 +230,12 @@ func processOneDomain(ctx context.Context, urls []SeedURL,
 		if sweep < 30*time.Second {
 			sweep = 30 * time.Second
 		}
-		if sweep > 10*time.Minute {
-			sweep = 10 * time.Minute
+		maxCap := cfg.AdaptiveTimeoutMax
+		if maxCap <= 0 {
+			maxCap = 10 * time.Minute
+		}
+		if sweep > maxCap {
+			sweep = maxCap
 		}
 		effectiveDomainTimeout = sweep
 	}

@@ -869,15 +869,16 @@ func newCCRecrawl() *cobra.Command {
 		limit               int
 		batchSize           int
 		engine              string
-		domainTimeoutMs     int
-		domainFailThreshold int
-		domainDeadProbe     int
-		domainStallRatio    int
-		retryTimeoutMs      int
-		noRetry             bool
-		dbMemMB             int
-		dbShards            int
-		chunkMode           string
+		domainTimeoutMs      int
+		domainFailThreshold  int
+		domainDeadProbe      int
+		domainStallRatio     int
+		domainTimeoutMaxMs   int
+		retryTimeoutMs       int
+		noRetry              bool
+		dbMemMB              int
+		dbShards             int
+		chunkMode            string
 	)
 
 	cmd := &cobra.Command{
@@ -960,6 +961,7 @@ Examples:
 			domainFailThreshold: domainFailThreshold,
 			domainDeadProbe:     domainDeadProbe,
 			domainStallRatio:    domainStallRatio,
+			domainTimeoutMaxMs:  domainTimeoutMaxMs,
 			retryTimeoutMs:      retryTimeoutMs,
 			noRetry:             noRetry,
 			dbMemMB:             dbMemMB,
@@ -997,11 +999,12 @@ Examples:
 	cmd.Flags().IntVar(&domainFailThreshold, "domain-fail-threshold", -1, "Abandon domain after this many timeout rounds (×conns); -1=engine default (3)")
 	cmd.Flags().IntVar(&domainDeadProbe, "domain-dead-probe", 10, "Abandon domain after this many consecutive timeouts with 0 successes (0=disabled)")
 	cmd.Flags().IntVar(&domainStallRatio, "domain-stall-ratio", 20, "Abandon domain when timeouts ≥ successes×ratio after dead-probe window (0=disabled; 20 = >95% timeout rate)")
+	cmd.Flags().IntVar(&domainTimeoutMaxMs, "domain-timeout-max", 0, "Upper bound for adaptive per-domain timeout in ms (0=default 10min); lower values free workers faster from slow domains")
 	cmd.Flags().IntVar(&retryTimeoutMs, "retry-timeout", 10000, "Pass-2 timeout in ms for retrying timeout URLs (0=disabled)")
 	cmd.Flags().BoolVar(&noRetry, "no-retry", false, "Skip pass-2 retry of timeout URLs")
 	cmd.Flags().IntVar(&dbMemMB, "db-mem-mb", 0, "DuckDB memory per shard in MB (0=auto: 15% avail RAM / shards)")
 	cmd.Flags().IntVar(&dbShards, "db-shards", 0, "ResultDB shard count (0=auto: clamp(CPUs×2, 4, 16))")
-	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "stream", "Seed delivery mode: stream|batch (stream: sort-then-stream, lower memory; batch: N-domain chunks with DuckDB reopen between batches)")
+	cmd.Flags().StringVar(&chunkMode, "chunk-mode", "stream", "Seed delivery mode: stream|pipeline|batch (stream: sort-then-stream; pipeline: low-memory cursor from seed DB, use for >1M seeds to prevent OOM; batch: N-domain chunks)")
 
 	return cmd
 }
@@ -1031,13 +1034,16 @@ type ccRecrawlOpts struct {
 	engine              string
 	domainTimeoutMs     int
 	domainFailThreshold int
-	domainDeadProbe     int
-	domainStallRatio    int
-	retryTimeoutMs      int
-	noRetry             bool
-	dbMemMB             int
-	dbShards            int
-	chunkMode           string
+	domainDeadProbe      int
+	domainStallRatio     int
+	domainTimeoutMaxMs   int
+	retryTimeoutMs       int
+	noRetry              bool
+	dbMemMB              int
+	dbShards             int
+	chunkMode            string
+	seedDBPath           string // set when seeds are pre-materialized for pipeline mode
+	totalSeeds           int64  // pre-extraction count for pipeline mode coverage display
 }
 
 func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
@@ -1122,22 +1128,49 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 		fmt.Println()
 		sourceParquetPath = parquetPath
 
-		// ── Step 2: Extract URLs directly from parquet (zero import) ──
-		fmt.Println(infoStyle.Render("Step 2: Extracting URLs directly from parquet (zero DuckDB import)..."))
+		// ── Step 2: Extract URLs from parquet ──
+		// pipeline mode: materialize to DuckDB (no Go heap) — use for >1M seeds to prevent OOM.
+		// stream mode (default): load all seeds into memory (faster for small-medium runs).
 		printFilterSummary(opts.filter)
-
 		extractStart := time.Now()
-		seeds, uniqueDomains, err = cc.ExtractSeedURLsFromParquet(ctx, parquetPath, opts.filter)
-		if err != nil {
-			return fmt.Errorf("extracting seeds from parquet: %w", err)
+
+		if opts.chunkMode == "pipeline" {
+			// Compute run dir early so we can place seeds.duckdb next to result/failed DBs.
+			runDir := ccRecrawlParquetRunDir(ccCfg, sourceParquetPath)
+			seedDBPath := filepath.Join(runDir, "seeds.duckdb")
+			if err := os.MkdirAll(runDir, 0o755); err != nil {
+				return fmt.Errorf("creating run dir: %w", err)
+			}
+			fmt.Println(infoStyle.Render("Step 2: Materializing seeds to DuckDB (pipeline mode, no Go heap)..."))
+			var seedCount int
+			seedCount, uniqueDomains, err = cc.WriteSeedURLsFromParquet(ctx, parquetPath, opts.filter, seedDBPath)
+			if err != nil {
+				return fmt.Errorf("materializing seeds: %w", err)
+			}
+			if seedCount == 0 {
+				fmt.Println(warningStyle.Render("  No matching URLs found in parquet"))
+				return nil
+			}
+			fmt.Println(successStyle.Render(fmt.Sprintf("  %s URLs across %s domains → %s (%s)",
+				ccFmtInt64(int64(seedCount)), ccFmtInt64(int64(uniqueDomains)),
+				filepath.Base(seedDBPath),
+				time.Since(extractStart).Truncate(time.Millisecond))))
+			opts.seedDBPath = seedDBPath
+			opts.totalSeeds = int64(seedCount)
+		} else {
+			fmt.Println(infoStyle.Render("Step 2: Extracting URLs directly from parquet (zero DuckDB import)..."))
+			seeds, uniqueDomains, err = cc.ExtractSeedURLsFromParquet(ctx, parquetPath, opts.filter)
+			if err != nil {
+				return fmt.Errorf("extracting seeds from parquet: %w", err)
+			}
+			if len(seeds) == 0 {
+				fmt.Println(warningStyle.Render("  No matching URLs found in parquet"))
+				return nil
+			}
+			fmt.Println(successStyle.Render(fmt.Sprintf("  %s URLs across %s domains (%s)",
+				ccFmtInt64(int64(len(seeds))), ccFmtInt64(int64(uniqueDomains)),
+				time.Since(extractStart).Truncate(time.Millisecond))))
 		}
-		if len(seeds) == 0 {
-			fmt.Println(warningStyle.Render("  No matching URLs found in parquet"))
-			return nil
-		}
-		fmt.Println(successStyle.Render(fmt.Sprintf("  %s URLs across %s domains (%s)",
-			ccFmtInt64(int64(len(seeds))), ccFmtInt64(int64(uniqueDomains)),
-			time.Since(extractStart).Truncate(time.Millisecond))))
 		fmt.Println()
 
 	default:
@@ -1229,7 +1262,17 @@ func runCCRecrawl(ctx context.Context, opts ccRecrawlOpts) error {
 	}
 
 	var dnsResolver *recrawler.DNSResolver
-	if opts.dnsPrefetch {
+	if opts.dnsPrefetch && opts.seedDBPath != "" {
+		// Pipeline mode: seeds are in a DB file, not in Go memory.
+		// DNS prefetch needs to iterate hosts — load cache only; new hosts resolved at crawl time via DomainDeadProbe.
+		dnsResolver = recrawler.NewDNSResolver(dnsTimeout)
+		if cached, _ := dnsResolver.LoadCache(dnsPath); cached > 0 {
+			fmt.Println(infoStyle.Render(fmt.Sprintf("DNS cache (pipeline mode): %d cached entries loaded", cached)))
+		} else {
+			fmt.Println(labelStyle.Render("DNS prefetch skipped (pipeline mode — seeds in DB; dead domains handled by DomainDeadProbe=10)"))
+		}
+		fmt.Println()
+	} else if opts.dnsPrefetch {
 		fmt.Println(infoStyle.Render("Batch DNS pre-resolution..."))
 
 		dnsResolver = recrawler.NewDNSResolver(dnsTimeout)
@@ -1372,6 +1415,14 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		dnsCache = &crawl.NoopDNS{}
 	}
 
+	chunkMode := opts.chunkMode
+	seedPath := opts.seedDBPath
+	// When seeds were pre-materialized to a DB (pipeline mode), force ChunkMode=pipeline
+	// so runWithChunkMode uses the SeedCursor path even if opts.chunkMode is "stream".
+	if seedPath != "" {
+		chunkMode = "pipeline"
+	}
+
 	jcfg := crawl.JobConfig{
 		Engine:              opts.engine,
 		Workers:             opts.workers,
@@ -1385,10 +1436,21 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		DomainDeadProbe:     opts.domainDeadProbe,
 		DomainStallRatio:    opts.domainStallRatio,
 		BatchSize:           opts.batchSize,
-		ChunkMode:           opts.chunkMode,
+		ChunkMode:           chunkMode,
+		SeedPath:            seedPath,
 	}
 	if opts.domainTimeoutMs != 0 {
 		jcfg.DomainTimeout = time.Duration(opts.domainTimeoutMs) * time.Millisecond // -1ms = adaptive
+	}
+	if opts.domainTimeoutMaxMs > 0 {
+		jcfg.AdaptiveTimeoutMax = time.Duration(opts.domainTimeoutMaxMs) * time.Millisecond
+	}
+
+	// Seed count for coverage display: use pre-computed totalSeeds for pipeline mode,
+	// or len(seeds) for stream mode.
+	totalSeeds := opts.totalSeeds
+	if totalSeeds == 0 {
+		totalSeeds = int64(len(seeds))
 	}
 
 	// recrawler.SeedURL is a type alias for crawl.SeedURL — no conversion needed.
@@ -1406,7 +1468,8 @@ func runCCRecrawlV3(ctx context.Context, opts ccRecrawlOpts,
 		DBShards:     dbShards,
 		DBMemMB:      dbMemMB,
 		SysInfo:      si,
-		TotalSeeds:   int64(len(seeds)),
+		TotalSeeds:   totalSeeds,
+		SeedCount:    opts.totalSeeds,
 	})
 }
 

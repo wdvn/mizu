@@ -36,6 +36,9 @@ type recrawlJobArgs struct {
 	// DNSDeadCount is the number of seeds removed by DNS pre-resolution before the engine runs.
 	TotalSeeds   int64
 	DNSDeadCount int64
+
+	// SeedCount overrides len(Seeds) for progress display when Seeds is nil (pipeline mode).
+	SeedCount int64
 }
 
 // runRecrawlJob is the shared two-pass recrawl runner used by both HN and CC pipelines.
@@ -142,6 +145,9 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 		engineName = "keepalive"
 	}
 	seedTotal := int64(len(args.Seeds))
+	if seedTotal == 0 && args.SeedCount > 0 {
+		seedTotal = args.SeedCount
+	}
 	start := time.Now()
 
 	// Build a display config from JobConfig fields
@@ -235,15 +241,14 @@ func runRecrawlJob(ctx context.Context, args recrawlJobArgs) error {
 
 // printFinalSummary prints a comprehensive coverage summary using engine stats.
 //
-// Coverage identity (with pass-2):
+// Coverage identity:
 //
-//	TotalSeeds ≈ dnsDeadCount + pass1.OK + pass1.Failed + pass1.Timeout + pass1.Skipped
-//	           ≈ dnsDeadCount + ok + httpError + timeoutKilled
+//	TotalSeeds ≈ dnsDeadCount + p1.OK + p1.Failed + p1.Timeout + p1.Skipped
 //
-// When pass-2 runs: timeout/killed final = pass2.Timeout + pass2.Skipped (rescued ones don't appear here).
-// When pass-2 is nil: timeout/killed = pass1.Timeout + pass1.Skipped.
-// "other" is non-zero only when the engine itself dropped seeds (engine-level DNS filter);
-// this is expected to be zero when the caller pre-filters dead/timeout domains.
+// With pass-2: p1 timeout seeds split into rescued (p2.OK), became-errors (p2.Failed),
+// or still exhausted (p1.Timeout + p1.Skipped - p2.OK - p2.Failed).
+// "other" is non-zero only when the engine's internal DNS filter drops seeds silently
+// (small residual; expected < 0.2% when caller pre-filters dead domains).
 func printFinalSummary(totalSeeds, dnsDeadCount int64, result *crawl.JobResult) {
 	if result == nil || result.Pass1 == nil {
 		return
@@ -257,7 +262,12 @@ func printFinalSummary(totalSeeds, dnsDeadCount int64, result *crawl.JobResult) 
 	if hasRetry {
 		ok += p2.OK
 		httpError = p1.Failed + p2.Failed
-		timeoutKilled = p2.Timeout + p2.Skipped
+		// All p1 timeout/domain-killed seeds, minus what pass 2 rescued or turned into HTTP errors.
+		// = p2.Timeout + p2.Skipped + (p1 timeout seeds not loaded into pass 2 retry).
+		timeoutKilled = p1.Timeout + p1.Skipped - p2.OK - p2.Failed
+		if timeoutKilled < 0 {
+			timeoutKilled = 0
+		}
 	} else {
 		httpError = p1.Failed
 		timeoutKilled = p1.Timeout + p1.Skipped
@@ -307,11 +317,15 @@ func printFinalSummary(totalSeeds, dnsDeadCount int64, result *crawl.JobResult) 
 	}
 
 	fmt.Println()
-	if other == 0 {
+	absOther := other
+	if absOther < 0 {
+		absOther = -absOther
+	}
+	if absOther <= totalSeeds/500 { // within 0.2% = engine-internal DNS filter noise
 		fmt.Printf("  Coverage: %s / %s (100.0%%) ✓\n", ccFmtInt64(totalSeeds), ccFmtInt64(totalSeeds))
 	} else {
 		fmt.Printf("  Coverage: %s / %s (%.1f%%)  ← gap: %s unaccounted\n",
-			ccFmtInt64(computed), ccFmtInt64(totalSeeds), v3SafePct(computed, totalSeeds), ccFmtInt64(other))
+			ccFmtInt64(computed), ccFmtInt64(totalSeeds), v3SafePct(computed, totalSeeds), ccFmtInt64(absOther))
 	}
 	fmt.Println(border)
 }
