@@ -71,6 +71,17 @@ but the crawler handles them gracefully (instant fail, no network overhead).
 
 **Scale**: ~942/10K seeds (9.4%). This is the expected dead-domain rate for HN URLs.
 
+**Sub-categories** (10K benchmark):
+
+| Sub-category | Count | % of DNS | Pattern |
+|-------------|-------|----------|---------|
+| **nxdomain** | 911 | 97.9% | `no records found`, `nxdomain`, `name or service not known`, `no address associated` |
+| **malformed** | 18 | 1.9% | `malformed`, `invalid character`, `label bytes exceed 63` |
+| **other** | 0 | 0.0% | servfail, network error, etc. |
+
+NXDOMAIN dominates — 98% of DNS errors are dead domains. Malformed labels (1.9%) are
+seed quality issues (domain with invalid characters, oversized labels).
+
 **Note**: With hickory-dns (async DNS), NXDOMAIN returns in <5ms. Without it (system DNS
 via getaddrinfo), NXDOMAIN takes 3-15s and gets misclassified as timeout.
 
@@ -88,11 +99,21 @@ via getaddrinfo), NXDOMAIN takes 3-15s and gets misclassified as timeout.
 - `tcp connect error: No route to host (os error 113)`
 - `connection closed before message completed`
 
-**Scale**: ~75/10K seeds (0.75%). These are genuinely dead servers.
+**Scale**: ~78/10K seeds (0.78%). These are genuinely dead servers.
 
-**Subcategories**:
+**Sub-categories** (10K benchmark):
+
+| Sub-category | Count | % of Conn | Pattern |
+|-------------|-------|-----------|---------|
+| **refused** | 38 | 48.7% | `connection refused` — server exists but not listening on 80/443 |
+| **eof** | 15 | 19.2% | `unexpected eof`, `connection closed`, `broken pipe` — server closes mid-request |
+| **reset** | 2 | 2.6% | `reset by peer`, `connection reset` — server actively rejects |
+| **other** | 23 | 29.5% | Network unreachable, no route to host, other OS errors |
+
+**Notable sub-patterns**:
 - **Connection refused** (port closed): server exists but not listening on 80/443
-- **Connection reset**: server actively rejects the connection
+- **Connection reset**: server actively rejects the connection (rate limiting, IP blocking)
+- **EOF/closed**: server accepts TCP but drops connection before response (load balancers, WAFs)
 - **Network unreachable**: routing failure
 - **Localhost URLs**: `127.0.0.1:8000`, `0.0.0.0:8080` — HN submissions with dev URLs
 
@@ -109,10 +130,17 @@ via getaddrinfo), NXDOMAIN takes 3-15s and gets misclassified as timeout.
 - `tls error: alert received: handshake_failure`
 - `ssl error: unsupported protocol`
 
-**Scale**: ~17/10K seeds (0.17%)
+**Scale**: ~13/10K seeds (0.13%)
 
 **Note**: We use `danger_accept_invalid_certs(true)`, so most TLS errors are protocol-level
 failures (ancient TLS 1.0 servers, broken SNI, etc.), not certificate validation.
+
+**HTTP-only server investigation**: Many TLS errors may come from HTTP-only servers where
+the seed URL has `https://` but the server only supports HTTP. Since our reqwest engine
+uses `native-tls-vendored` without HTTPS→HTTP fallback, these fail permanently. Potential
+fix: detect TLS handshake failures and retry with `http://` scheme. The hyper engine
+already supports this via `.https_or_http()` in its connector. For reqwest: would need
+explicit retry logic or URL normalization to test both schemes.
 
 ---
 
@@ -121,16 +149,32 @@ failures (ancient TLS 1.0 servers, broken SNI, etc.), not certificate validation
 **Cause**: Server didn't respond within the configured timeout (default 1s).
 **fetch_time_ms**: ~= timeout value (1000ms for pass 1, 15000ms for pass 2)
 
-**Scale**: ~3,674/10K seeds (36.7%). This is the largest error category.
+**Scale**: ~3,747/10K seeds (37.5%). This is the largest error category.
+
+**Sub-categories** (10K benchmark):
+
+| Sub-category | Count | % of Timeout | Meaning |
+|-------------|-------|-------------|---------|
+| **response** | 3,732 | 99.6% | Full HTTP timeout — server didn't respond within 1s |
+| **connect** | 15 | 0.4% | TCP/TLS connect timeout — couldn't establish connection |
+
+**Classification logic**: `timeout_connect` when `fetch_ms < 90% × cfg.timeout`,
+`timeout_response` otherwise. Response timeouts dominate overwhelmingly.
 
 **Root causes**:
 - **Dead servers that accept TCP but don't respond** (SYN-ACK then silence)
 - **Bot-holding**: Some servers detect crawler User-Agent and hold the connection open
-  (respond in <200ms for browser UAs, >5s for crawler UAs)
-- **Overloaded servers**: legitimate sites that are too slow
+  (respond in <200ms for browser UAs, >5s for crawler UAs) — see spec/0635
+- **Overloaded servers**: legitimate sites that are too slow for 1s
 - **Firewall drop**: SYN gets through but response is dropped (vs refused)
 
 **Mitigation**: Pass 2 retries timeouts with 15s timeout — rescues ~86% of timeout URLs.
+
+**Timeout layer analysis**: 99.6% of timeouts are response timeouts (full 1s). This means
+nearly all timeouts are servers that accepted TCP but never replied within 1s. A multi-layer
+timeout strategy (1s → 3s → 15s) could incrementally rescue more, but pass 2 at 15s already
+achieves 86% rescue rate. The jump from 1s→15s is large; a 3-5s intermediate pass could
+rescue servers that are "slow but alive" without the 15s cost per URL. See analysis below.
 
 ---
 
@@ -239,5 +283,55 @@ Total seeds: 1,539,560
 | **Total garbage** | **~384** | **0.025%** |
 
 Most seed URLs are syntactically valid but point to dead/unreachable servers.
-The actual error breakdown at 10K scale: 52.6% OK, 36.7% Timeout, 9.4% DNS dead,
-0.75% Connection dead, 0.35% Invalid URL, 0.17% TLS error.
+The actual error breakdown at 10K scale: 52.0% OK, 37.5% Timeout, 9.3% DNS dead,
+0.78% Connection dead, 0.34% Invalid URL, 0.13% TLS error.
+
+---
+
+## Timeout Layer Analysis
+
+### Current strategy: 2-pass (1s → 15s)
+- Pass 1: 1s timeout — catches fast sites, timeouts = 37.5% of seeds
+- Pass 2: 15s timeout — retries pass-1 timeouts, rescues ~86%
+- Gap: 1s to 15s is a 15× jump
+
+### Why 1s is too short (but right for pass 1)
+At 1s, we capture all sites responding in <1s (~52% OK rate). The remaining 37.5%
+timeouts include:
+- **Bot-holding servers** (~30-40% of timeouts): Hold connection >5s for crawler UAs
+- **Genuinely slow servers** (~20-30%): Server alive but slow (2-5s response)
+- **Dead servers** (~30-40%): Accept TCP SYN-ACK but never respond
+
+1s is correct for pass 1 — it's fast enough for throughput and catches the healthy sites.
+The question is whether the 1s→15s jump loses information.
+
+### Potential 3-pass strategy: 1s → 5s → 15s
+| Pass | Timeout | Target | Expected rescue |
+|------|---------|--------|-----------------|
+| 1 | 1s | Fast sites | 52% OK rate |
+| 2 | 5s | Slow-but-alive sites | ~40-50% of P1 timeouts |
+| 3 | 15s | Bot-holding + very slow | ~60-70% of P2 timeouts |
+
+**Trade-off**: An intermediate 5s pass would:
+- Separate "slow-but-alive" (2-5s) from "bot-holding" (>5s) and "dead" (never responds)
+- Cost ~5× more time than pass 1 per URL, vs 15× for current pass 2
+- Reduce pass-3 input size by ~40-50%, making the expensive 15s pass much smaller
+
+**Recommendation**: Current 2-pass (86% rescue) is good enough. A 3-pass adds complexity
+for marginal gain. Better ROI: fix bot-holding via UA rotation (see spec/0635).
+
+---
+
+## Full 10K Benchmark Results (with sub-categories)
+
+```
+OK:      5,199 (52.0%)
+Timeout: 3,747 (37.5%)
+  timeout: connect=15 response=3,732
+Failed:  1,054 (10.5%)
+  inv: 34  dns: 929  conn: 78  tls: 13  other: 0
+  dns:  nxdomain=911 malformed=18 other=0
+  conn: refused=38 reset=2 eof=15 other=23
+```
+
+Workers: 2,000, Timeout: 1s, Engine: reqwest, hickory-dns enabled.
